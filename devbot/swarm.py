@@ -15,7 +15,10 @@ more robust result by triangulating independent analyses.
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
+import shutil
+import sys
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -163,6 +166,264 @@ MEGASWARM_REVIEWER_PROMPT = (
 )
 
 
+# ---------------------------------------------------------------------------
+#  ParallelMonitor — live dashboard for megaswarm parallel phase
+# ---------------------------------------------------------------------------
+
+class AgentStatus:
+    """Live status of one parallel agent."""
+    __slots__ = ('label', 'phase', 'current_tool', 'last_snippet',
+                 'tokens', 'elapsed', 'state', 'last_update')
+
+    def __init__(self, label: str):
+        self.label = label
+        self.phase = 'running'       # running | done | failed
+        self.current_tool: str | None = None
+        self.last_snippet = ''
+        self.tokens = 0
+        self.elapsed = 0.0
+        self.state = 'starting'
+        self.last_update = time.time()
+
+
+class ParallelMonitor:
+    """Live dashboard that redraws one status line per parallel agent in-place.
+
+    Uses ANSI cursor moves to update a fixed block of terminal lines at ~10 Hz.
+    When there are many agents or stdout is not a TTY, falls back to plain lines.
+    """
+
+    # Collapse to summary + top-N when more agents than this.
+    _COLLAPSE_THRESHOLD = 8
+    _MAX_COLLAPSED_LINES = 5  # summary + up to 4 most-recent agents
+    _MIN_TERM_WIDTH = 40      # below this, truncation would slice ANSI escapes
+
+    def __init__(self, labels: list[str]):
+        self._labels = labels
+        self._n = len(labels)
+        self.statuses: dict[str, AgentStatus] = {}
+        self._lock = threading.Lock()
+        self._render_thread: threading.Thread | None = None
+        self._running = False
+        self._start_time = 0.0   # set in start()
+        self._is_tty = sys.stdout.isatty()
+        raw_w = shutil.get_terminal_size().columns if self._is_tty else 120
+        self._term_width = max(raw_w, self._MIN_TERM_WIDTH)
+        self._collapse = self._n > self._COLLAPSE_THRESHOLD
+        self._lines_printed = 0
+        self._first_render = True
+        # Pick icons the terminal can actually render.
+        self._icons = self._choose_icons()
+
+    # ---- public API -----------------------------------------------------------
+
+    def start(self):
+        """Print initial blank lines and launch the render thread (TTY only)."""
+        if not self._is_tty:
+            return
+        self._start_time = time.time()
+        self._running = True
+        lines = self._dashboard_line_count()
+        for _ in range(lines):
+            print()
+        self._lines_printed = lines
+        self._render_thread = threading.Thread(target=self._render_loop,
+                                               daemon=True)
+        self._render_thread.start()
+
+    def stop(self):
+        """Stop the render thread, do a final redraw, and move past the block."""
+        self._running = False
+        if self._render_thread:
+            self._render_thread.join(timeout=0.8)
+        if self._is_tty:
+            self._render()
+            # Move cursor below the dashboard block so subsequent prints
+            # don't overwrite it.
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+    def update(self, label: str, **kwargs):
+        """Thread-safe update of one agent's status fields."""
+        now = time.time()
+        with self._lock:
+            st = self.statuses.get(label)
+            if st is None:
+                st = self.statuses[label] = AgentStatus(label)
+            for k, v in kwargs.items():
+                if hasattr(st, k):
+                    setattr(st, k, v)
+            st.last_update = now
+            if 'elapsed' not in kwargs:
+                st.elapsed = now - self._start_time
+
+    def get_hooks(self, label: str):
+        """Return (on_text, on_tool_start, on_tool_end) wired to this monitor.
+
+        The closures capture *label* so each sub-agent writes to its own slot.
+        """
+
+        def on_text(chunk: str):
+            with self._lock:
+                st = self.statuses.get(label)
+                if st is not None:
+                    st.last_snippet = (st.last_snippet + chunk)[-60:]
+
+        def on_tool_start(name: str, args: dict):
+            preview = json.dumps(args)
+            if len(preview) > 60:
+                preview = preview[:60] + "..."
+            tool_icon = self._icons.get('tool', '~')
+            self.update(label, current_tool=f"{tool_icon} {name} {preview}",
+                        state='in-tool')
+
+        def on_tool_end(result: str):
+            self.update(label, current_tool=None, state='idle')
+
+        return on_text, on_tool_start, on_tool_end
+
+    # ---- internal render logic ------------------------------------------------
+
+    @staticmethod
+    def _can_encode(ch: str) -> bool:
+        """Return True if *ch* can be encoded by stdout."""
+        try:
+            ch.encode(sys.stdout.encoding or 'utf-8')
+            return True
+        except (UnicodeEncodeError, UnicodeError, LookupError):
+            return False
+
+    @classmethod
+    def _choose_icons(cls) -> dict:
+        """Return a dict of phase/state → safe icon character."""
+        if cls._can_encode('\u23f3'):       # ⏳
+            return {'running': '\u23f3', 'done': '\u2705',
+                    'failed': '\u274c', 'tool': '\u23ba'}
+        else:
+            # ASCII-safe fallbacks for narrow encodings (cp1252, etc.)
+            return {'running': '>', 'done': '+', 'failed': '!', 'tool': '~'}
+
+    def _dashboard_line_count(self) -> int:
+        """How many terminal lines the dashboard occupies."""
+        if self._collapse:
+            return self._MAX_COLLAPSED_LINES
+        return self._n
+
+    def _render_loop(self):
+        """Background thread: redraw at ~10 Hz while running."""
+        from .agent import _CONFIRM_LOCK  # hoisted; safe (both modules loaded)
+        while self._running:
+            # Pause while an interactive approval prompt holds the console
+            # lock; drawing mid-prompt corrupts the screen.
+            if not _CONFIRM_LOCK.locked():
+                try:
+                    self._render()
+                except Exception:
+                    # Don't let a render glitch kill the dashboard thread.
+                    pass
+            time.sleep(0.1)
+
+    def _render(self):
+        """Redraw the entire dashboard block in-place."""
+        if not self._is_tty:
+            return
+
+        with self._lock:
+            lines = self._build_lines()
+
+        # On the very first render the cursor is already at the right spot
+        # (just after the blank lines printed by .start()).  Subsequent renders
+        # must jump back up to the top of the block.
+        if not self._first_render and self._lines_printed:
+            sys.stdout.write(f"\x1b[{self._lines_printed}A")
+        self._first_render = False
+
+        # Write each status line, clearing to end-of-line first.
+        for i, line in enumerate(lines):
+            sys.stdout.write(f"\x1b[2K{line}\n")
+
+        # If the block shrank (e.g. collapse threshold crossed), erase the
+        # leftover lines from the previous render.
+        for _ in range(len(lines), self._lines_printed):
+            sys.stdout.write("\x1b[2K\n")
+
+        self._lines_printed = len(lines)
+        sys.stdout.flush()
+
+    def _build_lines(self) -> list[str]:
+        """Build the dashboard lines from current statuses."""
+        if not self.statuses:
+            return ["\x1b[90m  Starting...\x1b[0m"]
+
+        if self._collapse:
+            return self._build_collapsed()
+        return self._build_full()
+
+    def _build_collapsed(self) -> list[str]:
+        """Summary line + the few most-recently-active agents."""
+        running, done, failed = self._count_phases()
+        summary = (
+            f"\x1b[35;1m══ {self._n} agents:\x1b[0m "
+            f"\x1b[33m{running} running\x1b[0m, "
+            f"\x1b[32m{done} done\x1b[0m, "
+            f"\x1b[31m{failed} failed\x1b[0m"
+        )
+        lines = [summary]
+        sorted_st = sorted(self.statuses.values(),
+                           key=lambda s: (s.last_update, s.label),
+                           reverse=True)
+        for st in sorted_st[:self._MAX_COLLAPSED_LINES - 1]:
+            lines.append(self._format_line(st))
+        return lines
+
+    def _build_full(self) -> list[str]:
+        """One line per agent (in label order)."""
+        lines = []
+        for label in self._labels:
+            st = self.statuses.get(label)
+            if st is not None:
+                lines.append(self._format_line(st))
+            else:
+                lines.append(f" \x1b[90m{label}\x1b[0m  \x1b[90m…\x1b[0m")
+        return lines
+
+    def _count_phases(self):
+        """Return (running, done, failed) counts."""
+        running = sum(1 for s in self.statuses.values() if s.phase == 'running')
+        done = sum(1 for s in self.statuses.values() if s.phase == 'done')
+        failed = sum(1 for s in self.statuses.values() if s.phase == 'failed')
+        return running, done, failed
+
+    def _format_line(self, st: AgentStatus) -> str:
+        """Format one agent status line, truncated to terminal width."""
+        w = self._term_width
+
+        icon = self._icons.get(st.phase, '?')
+        label = st.label[:14]
+
+        # Right-hand info: token count + elapsed seconds
+        right = f"{st.tokens:,}t {st.elapsed:.0f}s"
+
+        # Middle: tool name or last text snippet
+        middle = ""
+        if st.current_tool:
+            middle = f" {st.current_tool}"
+        elif st.last_snippet:
+            clean = st.last_snippet.replace('\n', ' ').replace('\r', '')
+            middle = f" {clean[-50:]}"
+
+        # Assemble, leaving space for the right-side info
+        base = f" {icon} \x1b[1m{label}\x1b[0m"
+        available = w - len(base) - len(right) - 2
+        if available > 6 and len(middle) > available:
+            middle = middle[:available - 1] + "\u2026"
+        elif available <= 6:
+            middle = ""
+        padding = max(1, w - len(base) - len(middle) - len(right))
+
+        return f"{base}{middle}{' ' * padding}{right}"[:w]
+
+
 def megadelegate_schema() -> dict:
     """The `megadelegate` tool definition added to the manager's tool set."""
     roles = ", ".join(MEGASWARM_TRIO)
@@ -225,6 +486,18 @@ def run_megaswarm(manager: "Agent", task: str, n: int = 3,
     else:
         role_list = [MEGASWARM_TRIO[i % len(MEGASWARM_TRIO)] for i in range(n)]
 
+    # ---- Pre-compute unique display labels ----------------------------------
+    # So the dashboard can show "coder", "coder-2", "coder-3", … from the start.
+    label_counts: dict[str, int] = {}
+    labels: list[str] = []
+    for r in role_list:
+        if r in label_counts:
+            label_counts[r] += 1
+            labels.append(f"{r}-{label_counts[r]}")
+        else:
+            label_counts[r] = 1
+            labels.append(r)
+
     # ---- Concurrency cap & semaphore ---------------------------------------
     max_parallel = int(os.environ.get("DEVBOT_MAX_PARALLEL", "8"))
     max_workers = min(n, max_parallel)
@@ -233,14 +506,23 @@ def run_megaswarm(manager: "Agent", task: str, n: int = 3,
     # ---- Token budget -------------------------------------------------------
     token_budget = int(os.environ.get("DEVBOT_TOKEN_BUDGET", "0"))
 
+    # ---- Live dashboard (TTY only) ------------------------------------------
+    monitor: ParallelMonitor | None = None
+    if sys.stdout.isatty():
+        monitor = ParallelMonitor(labels)
+
     label_desc = f"role={role}," if role else ""
     print(f"\n\x1b[35;1m╔═ MEGASWARM [n={n}, {label_desc} workers={max_workers}]\x1b[0m "
           f"\x1b[90m{task[:100]}\x1b[0m")
 
+    if monitor is not None:
+        monitor.start()
+
     # ---- Phase 1: run specialists in parallel ------------------------------
     start = time.time()
 
-    def _run_one(_role: str, _sem: threading.Semaphore) -> tuple[str, str, int]:
+    def _run_one(_role: str, _sem: threading.Semaphore,
+                 _label: str) -> tuple[str, str, int]:
         """Run a single specialist and return (role, answer, tokens)."""
         spec = SPECIALISTS[_role]
         allowed = spec["tools"]
@@ -252,15 +534,21 @@ def run_megaswarm(manager: "Agent", task: str, n: int = 3,
             auto_approve=manager.auto_approve,
             system_prompt=spec["prompt"],
             tool_schemas=schemas,
-            label=_role,
+            label=_label,
         )
         sub.client = manager.client
-        # Parallel agents would interleave streaming output. Silence hooks and
-        # surface a clean status line on completion instead.
-        sub.on_text = lambda chunk: None
-        sub.on_tool_start = lambda name, args: None
-        sub.on_tool_end = lambda result: None
-        sub._transient_line = lambda text, clear=False: None  # silence thinking indicator too
+
+        # Wire hooks to the live dashboard when available; otherwise silence
+        # them to avoid garbled interleaved output in non-TTY mode.
+        if monitor is not None:
+            sub.on_text, sub.on_tool_start, sub.on_tool_end = monitor.get_hooks(_label)
+            monitor.update(_label, phase='running')
+        else:
+            sub.on_text = lambda chunk: None
+            sub.on_tool_start = lambda name, args: None
+            sub.on_tool_end = lambda result: None
+        sub._transient_line = lambda text, clear=False: None  # silence thinking indicator
+
         # Interactive approval can't work in the parallel phase (agents would
         # race on stdin). Honor the manager's setting instead: if the user ran
         # with -y, auto-approve; otherwise DECLINE dangerous tools rather than
@@ -272,33 +560,37 @@ def run_megaswarm(manager: "Agent", task: str, n: int = 3,
         try:
             _sem.acquire()
             answer = sub.run(task)
+            if monitor is not None:
+                monitor.update(_label, phase='done', tokens=sub.total_tokens)
         except Exception as exc:
             answer = f"ERROR: {type(exc).__name__}: {exc}"
+            if monitor is not None:
+                monitor.update(_label, phase='failed')
         finally:
             _sem.release()
         return _role, (answer or "(specialist returned no text)"), sub.total_tokens
 
     results: dict[str, str] = {}
     skipped = 0
+    budget_msg = ""  # deferred budget-exhausted message (printed after dashboard)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures: dict[concurrent.futures.Future, str] = {}
-        for r in role_list:
-            futures[pool.submit(_run_one, r, sem)] = r
+        for r, lbl in zip(role_list, labels):
+            futures[pool.submit(_run_one, r, sem, lbl)] = lbl
 
         for fut in concurrent.futures.as_completed(futures):
-            r, answer, tokens = fut.result()
-            # If multiple agents share the same role, de-duplicate keys:
-            # "coder", "coder-2", "coder-3", ...
-            key = r
-            if key in results:
-                seq = 2
-                while f"{key}-{seq}" in results:
-                    seq += 1
-                key = f"{key}-{seq}"
+            try:
+                _, answer, tokens = fut.result()
+            except concurrent.futures.CancelledError:
+                continue  # future was cancelled by token-budget guard
+            key = futures[fut]  # pre-computed unique label
             results[key] = answer
             manager.total_tokens += tokens
             manager.delegation_count += 1
-            print(f"\x1b[35m  ╟─ [{key}] finished ({tokens:,} tokens)\x1b[0m")
+
+            if monitor is None:
+                # Non-TTY fallback: print a plain finished line.
+                print(f"\x1b[35m  ╟─ [{key}] finished ({tokens:,} tokens)\x1b[0m")
 
             # Check token budget after each agent completes.
             # If exceeded, cancel remaining unfinished futures so we don't
@@ -307,12 +599,26 @@ def run_megaswarm(manager: "Agent", task: str, n: int = 3,
                 for f in futures:
                     if not f.done():
                         f.cancel()
+                        # Mark skipped agents in the monitor
+                        if monitor is not None:
+                            monitor.update(futures[f], phase='failed',
+                                           state='skipped (budget)')
                         skipped += 1
                 if skipped:
-                    print(f"\x1b[33m  ╟─ Token budget exhausted "
-                          f"({manager.total_tokens:,} >= {token_budget:,}); "
-                          f"skipped {skipped} remaining agent(s)\x1b[0m")
+                    budget_msg = (
+                        f"\x1b[33m  ╟─ Token budget exhausted "
+                        f"({manager.total_tokens:,} >= {token_budget:,}); "
+                        f"skipped {skipped} remaining agent(s)\x1b[0m"
+                    )
+                    if monitor is None:
+                        print(budget_msg)
                 break
+
+    # ---- Stop the dashboard before printing phase summary -------------------
+    if monitor is not None:
+        monitor.stop()
+        if budget_msg:
+            print(budget_msg)
 
     phase1_elapsed = time.time() - start
     launched = len(results)

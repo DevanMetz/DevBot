@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -147,25 +148,46 @@ class Agent:
         When *clear* is False, write *text* on the current terminal line
         using a carriage return + clear-to-end-of-line.
         """
+        # Gracefully handle terminals that can't encode the text.
+        try:
+            encoded = text.encode(sys.stdout.encoding or 'utf-8', errors='replace')
+            safe = encoded.decode(sys.stdout.encoding or 'utf-8')
+        except (UnicodeError, LookupError):
+            safe = text.encode('ascii', errors='replace').decode('ascii')
         if clear:
             print("\r\x1b[2K", end="", flush=True)
         else:
-            print(f"\r{text}\x1b[K", end="", flush=True)
+            print(f"\r{safe}\x1b[K", end="", flush=True)
+
+    @staticmethod
+    def _safe_print(*args, **kwargs):
+        """print() that survives terminals that can't encode Unicode."""
+        try:
+            print(*args, **kwargs)
+        except UnicodeEncodeError:
+            # Replace non-encodable characters with '?'
+            safe_args = []
+            for a in args:
+                if isinstance(a, str):
+                    a = a.encode(sys.stdout.encoding or 'utf-8',
+                                  errors='replace').decode(sys.stdout.encoding or 'utf-8')
+                safe_args.append(a)
+            print(*safe_args, **kwargs)
 
     def on_text(self, chunk: str):
-        print(chunk, end="", flush=True)
+        self._safe_print(chunk, end="", flush=True)
 
     def on_tool_start(self, name: str, args: dict):
         preview = json.dumps(args)
         if len(preview) > 160:
             preview = preview[:160] + "..."
         tag = f"\x1b[35m[{self.label}]\x1b[0m " if self.label else ""
-        print(f"\n{tag}\x1b[36m⏺ {name}\x1b[0m {preview}")
+        self._safe_print(f"\n{tag}\x1b[36m>> {name}\x1b[0m {preview}")
 
     def on_tool_end(self, result: str):
         first = result.splitlines()[0] if result else ""
         n = len(result.splitlines())
-        print(f"\x1b[90m  ⎿ {first[:120]}{f' (+{n - 1} lines)' if n > 1 else ''}\x1b[0m")
+        self._safe_print(f"\x1b[90m  = {first[:120]}{f' (+{n - 1} lines)' if n > 1 else ''}\x1b[0m")
 
     def confirm(self, name: str, args: dict) -> bool:
         if self.auto_approve:
