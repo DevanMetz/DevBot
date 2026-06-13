@@ -285,3 +285,131 @@ class TestCacheHitPersistence:
         assert restored.prompt_cache_hit_tokens == 0
         assert restored.prompt_cache_miss_tokens == 0
         assert restored.total_tokens == 5000
+
+
+# ============================================================================
+# Phase 5b: Project config file (.devbot/config.toml)
+# ============================================================================
+
+
+class TestProjectConfigFile:
+    """Test .devbot/config.toml loading and precedence."""
+
+    def test_config_toml_applied_when_env_unset(self, tmp_path, monkeypatch):
+        """When no env var is set, values from config.toml are applied."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dummy")
+        # Ensure the env var is NOT set
+        monkeypatch.delenv("DEVBOT_LOOP_LIMIT", raising=False)
+
+        # Create .devbot/config.toml
+        devbot_dir = tmp_path / ".devbot"
+        devbot_dir.mkdir()
+        devbot_dir.joinpath("config.toml").write_text(
+            'loop_limit = 7\n'
+        )
+
+        from devbot.config import load_project_config, apply_project_config
+        load_project_config(tmp_path)
+        apply_project_config()
+
+        # After loading, os.environ should have the value
+        import os
+        assert os.environ.get("DEVBOT_LOOP_LIMIT") == "7"
+
+        # Now create an Agent — it should pick up loop_limit=7 from env
+        from devbot.agent import Agent
+        agent = Agent(root=tmp_path)
+        assert agent.loop_limit == 7
+
+    def test_env_var_overrides_config_toml(self, tmp_path, monkeypatch):
+        """Real env var wins over config.toml."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dummy")
+        monkeypatch.setenv("DEVBOT_LOOP_LIMIT", "12")
+
+        devbot_dir = tmp_path / ".devbot"
+        devbot_dir.mkdir()
+        devbot_dir.joinpath("config.toml").write_text(
+            'loop_limit = 7\n'
+        )
+
+        from devbot.config import load_project_config
+        load_project_config(tmp_path)
+
+        # Env var was already set, so config.toml must NOT overwrite it
+        import os
+        assert os.environ["DEVBOT_LOOP_LIMIT"] == "12"
+
+    def test_missing_config_toml_no_error(self, tmp_path, monkeypatch):
+        """Agent init works fine when .devbot/config.toml does not exist."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dummy")
+        monkeypatch.delenv("DEVBOT_LOOP_LIMIT", raising=False)
+
+        from devbot.agent import Agent
+        # Should not raise
+        agent = Agent(root=tmp_path)
+        # Default loop_limit should still be 3
+        assert agent.loop_limit == 3
+
+    def test_malformed_config_toml_no_error(self, tmp_path, monkeypatch):
+        """Agent init works fine when .devbot/config.toml is invalid TOML."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dummy")
+        monkeypatch.delenv("DEVBOT_LOOP_LIMIT", raising=False)
+
+        devbot_dir = tmp_path / ".devbot"
+        devbot_dir.mkdir()
+        devbot_dir.joinpath("config.toml").write_text(
+            'this is not valid toml {{{[[[\n'
+        )
+
+        from devbot.agent import Agent
+        # Should not raise — malformed TOML is silently ignored
+        agent = Agent(root=tmp_path)
+        assert agent.loop_limit == 3  # default
+
+    def test_config_toml_precedence_chain(self, tmp_path, monkeypatch):
+        """Verify precedence: env > .env > config.toml > default.
+
+        - config.toml sets loop_limit=7
+        - .env sets loop_limit=5 (overrides config.toml)
+        - env var sets loop_limit=12 (overrides .env)
+        """
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dummy")
+        monkeypatch.setenv("DEVBOT_LOOP_LIMIT", "12")
+
+        # Create config.toml (lowest priority)
+        devbot_dir = tmp_path / ".devbot"
+        devbot_dir.mkdir()
+        devbot_dir.joinpath("config.toml").write_text(
+            'loop_limit = 7\n'
+        )
+
+        # Create .env (middle priority)
+        tmp_path.joinpath(".env").write_text(
+            'DEVBOT_LOOP_LIMIT=5\n'
+        )
+
+        from devbot.agent import Agent
+        agent = Agent(root=tmp_path)
+        # Real env var (12) wins over .env (5) and config.toml (7)
+        assert agent.loop_limit == 12
+
+    def test_config_toml_dotenv_overrides(self, tmp_path, monkeypatch):
+        """.env overrides config.toml."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dummy")
+        monkeypatch.delenv("DEVBOT_LOOP_LIMIT", raising=False)
+        # No real env var for LOOP_LIMIT
+
+        devbot_dir = tmp_path / ".devbot"
+        devbot_dir.mkdir()
+        devbot_dir.joinpath("config.toml").write_text(
+            'loop_limit = 7\n'
+        )
+
+        tmp_path.joinpath(".env").write_text(
+            'DEVBOT_LOOP_LIMIT=5\n'
+        )
+
+        from devbot.agent import Agent
+        agent = Agent(root=tmp_path)
+        # .env (5) overrides config.toml (7)
+        assert agent.loop_limit == 5

@@ -10,7 +10,7 @@ from pathlib import Path
 # Module-level list of slash commands used by both the completer and the REPL loop.
 _SLASH_COMMANDS = [
     "/help", "/clear", "/stats", "/model", "/think", "/swarm", "/megaswarm",
-    "/resume", "/sessions", "/exit", "/tools", "/cost", "/export",
+    "/resume", "/sessions", "/exit", "/tools", "/cost", "/export", "/undo",
 ]
 
 
@@ -260,6 +260,14 @@ def main():
         if user == "/cost":
             cost = agent.estimated_cost()
             print(f"Estimated cost: ${cost:.2f} | Session tokens: {agent.total_tokens:,}")
+            continue
+        if user == "/undo":
+            from .tools import undo_last_edit
+            try:
+                result = undo_last_edit(root)
+                print(result)
+            except Exception as e:
+                print(f"\x1b[31m[error] Undo failed: {e}\x1b[0m", file=sys.stderr)
             continue
         if user.startswith("/export"):
             parts = user.split(maxsplit=1)

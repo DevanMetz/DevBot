@@ -769,7 +769,15 @@ PIPELINE_REVIEWER_PROMPT = (
     "Only list issues you are confident are real. Do not nitpick style."
 )
 
-_PIPELINE_MAX_FIX_ROUNDS = int(os.environ.get("DEVBOT_PIPELINE_ROUNDS", "2"))
+_PIPELINE_MAX_FIX_ROUNDS: int | None = None
+
+
+def _get_pipeline_rounds() -> int:
+    """Return the pipeline max fix rounds, initialising from env on first call."""
+    global _PIPELINE_MAX_FIX_ROUNDS
+    if _PIPELINE_MAX_FIX_ROUNDS is None:
+        _PIPELINE_MAX_FIX_ROUNDS = int(os.environ.get("DEVBOT_PIPELINE_ROUNDS", "2"))
+    return _PIPELINE_MAX_FIX_ROUNDS
 
 
 def pipeline_schema() -> dict:
@@ -807,7 +815,7 @@ def run_pipeline(manager: "Agent", task: str) -> str:
     build = run_specialist(manager, "coder", task)
     transcript.append(f"## Initial implementation\n{build}")
 
-    for round_no in range(1, _PIPELINE_MAX_FIX_ROUNDS + 1):
+    for round_no in range(1, _get_pipeline_rounds() + 1):
         review_task = (
             f"A coder was asked to do this task:\n{task}\n\n"
             f"Their summary of what they changed:\n{build}\n\n"
@@ -832,7 +840,7 @@ def run_pipeline(manager: "Agent", task: str) -> str:
         transcript.append(f"## Fixes (round {round_no})\n{build}")
     else:
         print(f"\x1b[33m  ╟─ pipeline hit round limit "
-              f"({_PIPELINE_MAX_FIX_ROUNDS}); some issues may remain\x1b[0m")
+              f"({_get_pipeline_rounds()}); some issues may remain\x1b[0m")
 
     print(f"\x1b[36;1m╚═ PIPELINE complete\x1b[0m")
     return "\n\n".join(transcript)

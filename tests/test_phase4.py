@@ -459,7 +459,7 @@ class TestGlobalTokenBudget:
         import devbot.autopilot as ap
         monkeypatch.setattr(ap, "check_global_budget_exceeded", mock_check)
         monkeypatch.setattr(ap, "get_global_token_count", lambda: 1000)
-        monkeypatch.setattr(ap, "_GLOBAL_BUDGET", 1000)
+        monkeypatch.setattr(ap, "_get_global_budget", lambda: 1000)
         # Mock Agent.run to avoid API calls and _run_tests to always pass
         monkeypatch.setattr(ap.Agent, "run", lambda self, prompt: "ok")
         monkeypatch.setattr(ap, "_run_tests", lambda root: (True, ""))
@@ -812,3 +812,170 @@ class TestExportMarkdown:
         out = export_markdown(agent, tmp_path / "none.md")
         text = out.read_text(encoding="utf-8")
         assert "# DevBot Session Export" in text
+
+
+# ============================================================================
+# 8. Edit checkpoints and undo
+# ============================================================================
+
+class TestEditBackups:
+    """Tests for backup-on-edit and undo_last_edit functionality."""
+
+    def test_write_file_creates_backup(self, tmp_path):
+        """Editing an existing file with write_file creates a backup."""
+        from devbot.tools import write_file, _BACKUPS_DIR
+
+        root = tmp_path
+        f = root / "test.txt"
+        f.write_text("original content", encoding="utf-8")
+
+        write_file("test.txt", "new content", root)
+
+        backups_root = root / _BACKUPS_DIR
+        assert backups_root.is_dir()
+        dirs = list(backups_root.iterdir())
+        assert len(dirs) == 1
+        backup_file = dirs[0] / "test.txt"
+        assert backup_file.is_file()
+        assert backup_file.read_text(encoding="utf-8") == "original content"
+
+    def test_edit_file_creates_backup(self, tmp_path):
+        """Editing an existing file with edit_file creates a backup."""
+        from devbot.tools import edit_file, _BACKUPS_DIR
+
+        root = tmp_path
+        f = root / "test.py"
+        f.write_text("x = 1\n", encoding="utf-8")
+
+        edit_file("test.py", "x = 1", "x = 2", root)
+
+        backups_root = root / _BACKUPS_DIR
+        dirs = list(backups_root.iterdir())
+        assert len(dirs) == 1
+        backup_file = dirs[0] / "test.py"
+        assert backup_file.read_text(encoding="utf-8") == "x = 1\n"
+
+    def test_new_file_no_backup(self, tmp_path):
+        """Creating a brand-new file does NOT create a backup."""
+        from devbot.tools import write_file, _BACKUPS_DIR
+
+        root = tmp_path
+        write_file("new.txt", "hello", root)
+
+        backups_root = root / _BACKUPS_DIR
+        # Either no backups dir, or empty
+        if backups_root.is_dir():
+            dirs = list(backups_root.iterdir())
+            assert len(dirs) == 0
+
+    def test_undo_last_edit_restores_file(self, tmp_path):
+        """undo_last_edit restores the previous content."""
+        from devbot.tools import write_file, undo_last_edit, _BACKUPS_DIR
+
+        root = tmp_path
+        f = root / "doc.md"
+        f.write_text("version 1", encoding="utf-8")
+
+        write_file("doc.md", "version 2", root)
+        assert f.read_text(encoding="utf-8") == "version 2"
+
+        result = undo_last_edit(root)
+        assert "Restored 1 file(s)" in result
+        assert "doc.md" in result
+        assert f.read_text(encoding="utf-8") == "version 1"
+
+        # Backup folder should be removed after restore
+        backups_root = root / _BACKUPS_DIR
+        if backups_root.is_dir():
+            dirs = list(backups_root.iterdir())
+            assert len(dirs) == 0
+
+    def test_undo_no_backups(self, tmp_path):
+        """undo_last_edit when no backups exist returns informative message."""
+        from devbot.tools import undo_last_edit
+
+        result = undo_last_edit(tmp_path)
+        assert "No backups found" in result
+
+    def test_prune_old_backups(self, tmp_path):
+        """Old backup sets beyond _MAX_BACKUP_SETS are pruned."""
+        from devbot.tools import _prune_backups, _BACKUPS_DIR, _MAX_BACKUP_SETS
+
+        root = tmp_path
+        backups_root = root / _BACKUPS_DIR
+        # Create more than _MAX_BACKUP_SETS backup folders with sequential names
+        for i in range(_MAX_BACKUP_SETS + 5):
+            d = backups_root / str(i).zfill(20)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "dummy.txt").write_text(f"v{i}", encoding="utf-8")
+
+        _prune_backups(root)
+
+        dirs = sorted(
+            [d for d in backups_root.iterdir() if d.is_dir()],
+            key=lambda d: d.name,
+            reverse=True,
+        )
+        assert len(dirs) == _MAX_BACKUP_SETS
+        # The oldest 5 should be gone (0-4)
+        existing_names = {d.name for d in dirs}
+        for i in range(5):
+            assert str(i).zfill(20) not in existing_names
+
+    def test_edit_file_error_no_backup(self, tmp_path):
+        """When edit_file fails (old_string not found), no backup is created."""
+        from devbot.tools import edit_file, _BACKUPS_DIR
+
+        root = tmp_path
+        f = root / "code.py"
+        f.write_text("print('hello')", encoding="utf-8")
+
+        result = edit_file("code.py", "nonexistent", "replacement", root)
+        assert "Error" in result
+
+        # No backup should have been created
+        backups_root = root / _BACKUPS_DIR
+        if backups_root.is_dir():
+            dirs = list(backups_root.iterdir())
+            assert len(dirs) == 0
+
+    def test_undo_restores_multiple_files(self, tmp_path):
+        """If multiple files were backed up in one set, all are restored."""
+        from devbot.tools import undo_last_edit, _BACKUPS_DIR
+
+        root = tmp_path
+        a = root / "a.txt"
+        b = root / "sub" / "b.txt"
+        a.write_text("new a", encoding="utf-8")
+        b.parent.mkdir(parents=True, exist_ok=True)
+        b.write_text("new b", encoding="utf-8")
+
+        # Create a backup set with original content
+        backup_dir = root / _BACKUPS_DIR / "1".zfill(20)
+        (backup_dir / "a.txt").parent.mkdir(parents=True, exist_ok=True)
+        (backup_dir / "a.txt").write_text("old a", encoding="utf-8")
+        (backup_dir / "sub" / "b.txt").parent.mkdir(parents=True, exist_ok=True)
+        (backup_dir / "sub" / "b.txt").write_text("old b", encoding="utf-8")
+
+        result = undo_last_edit(root)
+        assert "Restored 2 file(s)" in result
+        assert "a.txt" in result
+        assert "b.txt" in result
+        assert a.read_text(encoding="utf-8") == "old a"
+        assert b.read_text(encoding="utf-8") == "old b"
+
+    def test_write_file_nested_path_backup(self, tmp_path):
+        """Backup works for files in nested directories."""
+        from devbot.tools import write_file, undo_last_edit
+
+        root = tmp_path
+        f = root / "deep" / "nested" / "file.txt"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("deep original", encoding="utf-8")
+
+        write_file("deep/nested/file.txt", "deep modified", root)
+        assert f.read_text(encoding="utf-8") == "deep modified"
+
+        result = undo_last_edit(root)
+        assert "Restored 1 file(s)" in result
+        assert f.read_text(encoding="utf-8") == "deep original"

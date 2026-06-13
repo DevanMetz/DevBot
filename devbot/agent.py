@@ -15,6 +15,7 @@ _CONFIRM_LOCK = threading.Lock()
 
 from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError, InternalServerError
 
+from .config import load_project_config, apply_project_config
 from .tools import TOOL_SCHEMAS, DANGEROUS_TOOLS, ALLOW_LIST, dispatch, check_command
 from .devlog import log_tool_call, log_turn
 
@@ -33,7 +34,15 @@ KNOWN_MODELS = {"deepseek-v4-pro", "deepseek-v4-flash", "deepseek-chat", "deepse
 # autopilot / megaswarm runs.
 # ---------------------------------------------------------------------------
 _GLOBAL_TOKEN_COUNT = 0
-_GLOBAL_BUDGET = int(os.environ.get("DEVBOT_GLOBAL_BUDGET", "0") or "0")
+_GLOBAL_BUDGET: int | None = None
+
+
+def _get_global_budget() -> int:
+    """Return the global budget, initialising from env on first call."""
+    global _GLOBAL_BUDGET
+    if _GLOBAL_BUDGET is None:
+        _GLOBAL_BUDGET = int(os.environ.get("DEVBOT_GLOBAL_BUDGET", "0") or "0")
+    return _GLOBAL_BUDGET
 
 
 def reset_global_token_count() -> None:
@@ -49,7 +58,8 @@ def get_global_token_count() -> int:
 
 def check_global_budget_exceeded() -> bool:
     """Return True iff the global budget is set (>0) and has been reached."""
-    return _GLOBAL_BUDGET > 0 and _GLOBAL_TOKEN_COUNT >= _GLOBAL_BUDGET
+    budget = _get_global_budget()
+    return budget > 0 and _GLOBAL_TOKEN_COUNT >= budget
 
 
 def _load_dotenv(root: Path):
@@ -153,7 +163,9 @@ class Agent:
                  system_prompt: str | None = None, tool_schemas: list | None = None,
                  swarm: bool = False, megaswarm: bool = False,
                  label: str | None = None):
-        _load_dotenv(root)
+        load_project_config(root)   # stores config.toml values for later
+        _load_dotenv(root)          # .env overrides config.toml
+        apply_project_config()      # apply config.toml (env & .env win)
         api_key = os.environ.get("DEEPSEEK_API_KEY")
         if not api_key:
             raise SystemExit(
@@ -352,7 +364,7 @@ class Agent:
         if check_global_budget_exceeded():
             self._safe_print(
                 f"[devbot] Global token budget exhausted "
-                f"({get_global_token_count():,} >= {_GLOBAL_BUDGET:,}). "
+                f"({get_global_token_count():,} >= {_get_global_budget():,}). "
                 f"Process halted."
             )
             self._auto_save()
@@ -393,7 +405,7 @@ class Agent:
                 if check_global_budget_exceeded():
                     self._safe_print(
                         f"[devbot] Global token budget exhausted "
-                        f"({get_global_token_count():,} >= {_GLOBAL_BUDGET:,}). "
+                        f"({get_global_token_count():,} >= {_get_global_budget():,}). "
                         f"Session halted."
                     )
                 else:

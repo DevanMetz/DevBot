@@ -685,3 +685,284 @@ class TestStuckLoopDetection:
         captured = capsys.readouterr().out
 
         assert "Stuck error loop detected" not in captured
+
+
+# ============================================================================
+# 7. tree() — directory tree rendering
+# ============================================================================
+
+class TestTree:
+    """Tests for the tree() function in devbot.tools."""
+
+    def test_basic_tree_output(self, tmp_path):
+        """A simple directory structure produces a properly indented tree."""
+        from devbot.tools import tree
+
+        # Create structure:
+        # tmp_path/
+        #   a.txt
+        #   sub/
+        #     b.txt
+        #     deep/
+        #       c.txt
+        (tmp_path / "a.txt").write_text("a")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "b.txt").write_text("b")
+        deep = sub / "deep"
+        deep.mkdir()
+        (deep / "c.txt").write_text("c")
+
+        result = tree(str(tmp_path), tmp_path, max_depth=3)
+
+        # Header line is the directory path
+        assert str(tmp_path) in result
+        # Should contain box-drawing characters
+        assert "├──" in result or "└──" in result
+        # Should contain entries
+        assert "a.txt" in result
+        assert "sub/" in result
+        assert "b.txt" in result
+        assert "deep/" in result
+        assert "c.txt" in result
+
+    def test_max_depth_limits_nesting(self, tmp_path):
+        """max_depth=1 shows only the top-level children (depth 1)."""
+        from devbot.tools import tree
+
+        (tmp_path / "top.txt").write_text("x")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "nested.txt").write_text("y")
+        deep = sub / "deep"
+        deep.mkdir()
+        (deep / "very_nested.txt").write_text("z")
+
+        result = tree(str(tmp_path), tmp_path, max_depth=1)
+
+        assert "top.txt" in result
+        assert "sub/" in result
+        # Nested entries should NOT appear at max_depth=1
+        assert "nested.txt" not in result
+        assert "deep/" not in result
+        assert "very_nested.txt" not in result
+
+    def test_max_depth_2_shows_grandchildren(self, tmp_path):
+        """max_depth=2 shows children and grandchildren but not deeper."""
+        from devbot.tools import tree
+
+        (tmp_path / "top.txt").write_text("x")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "b.txt").write_text("y")
+        deep = sub / "deep"
+        deep.mkdir()
+        (deep / "c.txt").write_text("z")
+
+        result = tree(str(tmp_path), tmp_path, max_depth=2)
+
+        assert "top.txt" in result
+        assert "sub/" in result
+        assert "b.txt" in result
+        assert "deep/" in result
+        # depth 3 — should be excluded
+        assert "c.txt" not in result
+
+    def test_skip_dirs_pruning(self, tmp_path):
+        """Directories in SKIP_DIRS (e.g. .git) are excluded from output."""
+        from devbot.tools import tree, SKIP_DIRS
+
+        (tmp_path / "visible.txt").write_text("hi")
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "config").write_text("[core]")
+
+        result = tree(str(tmp_path), tmp_path, max_depth=3)
+
+        assert "visible.txt" in result
+        assert ".git" not in result
+        assert "config" not in result
+
+    def test_gitignore_pruning(self, tmp_path):
+        """Entries matching .gitignore patterns are excluded from the tree."""
+        from devbot.tools import tree
+
+        # Create .gitignore that ignores *.log and build/
+        (tmp_path / ".gitignore").write_text("*.log\nbuild/\n")
+        (tmp_path / "important.txt").write_text("keep")
+        (tmp_path / "debug.log").write_text("ignore me")
+        build_dir = tmp_path / "build"
+        build_dir.mkdir()
+        (build_dir / "output.o").write_text("obj")
+
+        result = tree(str(tmp_path), tmp_path, max_depth=3)
+
+        assert "important.txt" in result
+        assert ".gitignore" in result  # .gitignore itself is not gitignored
+        assert "debug.log" not in result
+        assert "build/" not in result
+        assert "output.o" not in result
+
+    def test_gitignore_dir_pattern_with_slash(self, tmp_path):
+        """Directory-only gitignore patterns (__pycache__/) are pruned."""
+        from devbot.tools import tree
+
+        (tmp_path / ".gitignore").write_text("__pycache__/\n")
+        (tmp_path / "app.py").write_text("pass")
+        pycache = tmp_path / "__pycache__"
+        pycache.mkdir()
+        (pycache / "app.cpython-311.pyc").write_text("")
+
+        result = tree(str(tmp_path), tmp_path, max_depth=3)
+
+        assert "app.py" in result
+        assert "__pycache__" not in result
+
+    def test_entry_cap_truncation(self, tmp_path):
+        """When entries exceed 500, a truncation note is appended."""
+        from devbot.tools import tree
+
+        # Create 510 files to trigger the cap
+        for i in range(510):
+            (tmp_path / f"file_{i:04d}.txt").write_text(str(i))
+
+        result = tree(str(tmp_path), tmp_path, max_depth=1)
+
+        assert "... [truncated at 500 entries]" in result
+        # Should have exactly 500 file entries + 1 header + 1 truncation
+        lines = result.splitlines()
+        # header line + 500 entries + truncation note
+        assert len(lines) <= 502  # header + 500 entries + truncation
+
+    def test_non_directory_path_returns_error(self, tmp_path):
+        """Calling tree on a file returns an error string."""
+        from devbot.tools import tree
+
+        f = tmp_path / "hello.txt"
+        f.write_text("hello")
+
+        result = tree(str(f), tmp_path)
+        assert result.startswith("Error:")
+        assert "not a directory" in result
+
+    def test_empty_directory_returns_header_only(self, tmp_path):
+        """An empty directory outputs just the header line."""
+        from devbot.tools import tree
+
+        result = tree(str(tmp_path), tmp_path, max_depth=3)
+        lines = result.splitlines()
+
+        assert len(lines) == 1
+        assert str(tmp_path) in lines[0]
+
+    def test_sandbox_enforcement_outside_root(self, tmp_path):
+        """A path outside the sandbox root raises PathError."""
+        from devbot.tools import tree, PathError
+
+        outside = tmp_path / ".." / "outside"
+        # We don't need the directory to exist — _resolve checks before stat
+        with pytest.raises(PathError):
+            tree(str(outside), tmp_path)
+
+    def test_sandbox_enforcement_absolute_outside_root(self, tmp_path):
+        """An absolute path outside the sandbox root raises PathError."""
+        from devbot.tools import tree, PathError
+
+        # Use a path that is definitely outside tmp_path
+        with pytest.raises(PathError):
+            tree("/etc", tmp_path)
+
+    def test_all_entries_skipped_returns_header_only(self, tmp_path):
+        """When everything in a directory is skipped (SKIP_DIRS + gitignore),
+        output is just the header line."""
+        from devbot.tools import tree
+
+        (tmp_path / ".gitignore").write_text("*\n")  # ignore everything
+        (tmp_path / "secret.txt").write_text("hidden")
+
+        result = tree(str(tmp_path), tmp_path, max_depth=3)
+        lines = result.splitlines()
+
+        assert len(lines) == 1
+        assert str(tmp_path) in lines[0]
+
+    def test_nested_gitignore_not_used(self, tmp_path):
+        """Only root's .gitignore is used, not nested ones."""
+        from devbot.tools import tree
+
+        # root .gitignore ignores *.log
+        (tmp_path / ".gitignore").write_text("*.log\n")
+        (tmp_path / "app.log").write_text("ignored")
+        (tmp_path / "keep.txt").write_text("visible")
+
+        # nested .gitignore (should be ignored by tree)
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / ".gitignore").write_text("*.txt\n")  # tries to ignore txt
+        (sub / "data.txt").write_text("should be visible")  # root .gitignore doesn't block txt
+
+        result = tree(str(tmp_path), tmp_path, max_depth=3)
+
+        assert "keep.txt" in result
+        assert "app.log" not in result
+        # data.txt should be visible because nested .gitignore is NOT consulted
+        assert "data.txt" in result
+
+    def test_unicode_filenames(self, tmp_path):
+        """Tree handles Unicode filenames correctly."""
+        from devbot.tools import tree
+
+        (tmp_path / "日本語.txt").write_text("unicode")
+        (tmp_path / "café").mkdir()
+        (tmp_path / "café" / "résumé.pdf").write_text("cv")
+
+        result = tree(str(tmp_path), tmp_path, max_depth=3)
+
+        assert "日本語.txt" in result
+        assert "café/" in result
+        assert "résumé.pdf" in result
+
+    def test_mixed_files_and_dirs_sorting(self, tmp_path):
+        """Directories sort after files; both are alphabetically sorted within group."""
+        from devbot.tools import tree
+
+        (tmp_path / "zebra.txt").write_text("z")
+        (tmp_path / "alpha.txt").write_text("a")
+        (tmp_path / "beta").mkdir()
+        (tmp_path / "alpha_dir").mkdir()
+
+        result = tree(str(tmp_path), tmp_path, max_depth=1)
+        lines = result.splitlines()
+
+        # Strip the tree-drawing prefix (whitespace + ├── / └── / │) to extract names
+        import re
+        entries = []
+        for line in lines[1:]:
+            # Remove leading tree-drawing prefix: whitespace, │, ├──, └──, spaces
+            name = re.sub(r'^[\s│├└─]+', '', line)
+            if name:
+                entries.append(name)
+
+        # Files first (alphabetical), then dirs (alphabetical)
+        file_names = [e for e in entries if not e.endswith("/")]
+        dir_names = [e for e in entries if e.endswith("/")]
+
+        assert file_names == ["alpha.txt", "zebra.txt"]
+        assert dir_names == ["alpha_dir/", "beta/"]
+
+        # Verify inter-group order: all files appear before all dirs
+        file_indices = [i for i, e in enumerate(entries) if not e.endswith("/")]
+        dir_indices = [i for i, e in enumerate(entries) if e.endswith("/")]
+        assert max(file_indices) < min(dir_indices), \
+            f"Files should appear before directories, got entries: {entries}"
+
+    def test_respects_cwd_dot_path(self, tmp_path, monkeypatch):
+        """tree('.') resolves relative to root."""
+        from devbot.tools import tree
+
+        (tmp_path / "dotfile.txt").write_text("dot")
+
+        # root is tmp_path, path="." should resolve to tmp_path
+        result = tree(".", tmp_path, max_depth=1)
+
+        assert "dotfile.txt" in result

@@ -16,6 +16,7 @@ from devbot.tools import (
     grep,
     find_files,
     run_command,
+    outline,
     dispatch,
     SKIP_DIRS,
     BLOCKED_PATTERNS,
@@ -778,3 +779,214 @@ class TestGitignoreIntegration:
         result_include = result_include.replace("\\", "/")
         assert "main.py" in result_include
         assert "main.pyc" in result_include
+
+
+# ============================================================================
+# 12. outline tool
+# ============================================================================
+
+class TestOutline:
+    """Tests for the outline(path, root) tool."""
+
+    # ---- Python files -------------------------------------------------------
+
+    def test_top_level_functions_and_classes(self, tmp_path):
+        """Top-level defs and classes are listed with line numbers and no indent."""
+        f = tmp_path / "mod.py"
+        f.write_text("""\
+def my_function(a, b):
+    pass
+
+class MyClass:
+    pass
+
+async def async_top(x=1):
+    pass
+""")
+        result = outline("mod.py", tmp_path)
+        lines = result.splitlines()
+        assert lines[0].startswith("1: def my_function")
+        assert "MyClass" in lines[1]
+        assert "async def async_top" in lines[2]
+
+    def test_nested_definitions_in_classes(self, tmp_path):
+        """Classes show nested defs with 2-space indentation per nesting level."""
+        f = tmp_path / "nested.py"
+        f.write_text("""\
+class Outer:
+    def method(self, x):
+        pass
+
+    class Inner:
+        def deep(self):
+            pass
+
+    async def async_method(self):
+        pass
+""")
+        result = outline("nested.py", tmp_path)
+        lines = result.splitlines()
+        # Outer class at line 1
+        assert lines[0] == "1: class Outer"
+        # method at line 2, indent 1 (2 spaces after ": ")
+        # strip the "N: " prefix then check
+        assert lines[1].split(": ", 1)[1] == "  def method(self, x)"
+        # Inner class at line 5, indent 1
+        assert lines[2].split(": ", 1)[1] == "  class Inner"
+        # deep at line 6, indent 2 (4 spaces after ": ")
+        assert lines[3].split(": ", 1)[1] == "    def deep(self)"
+        # async_method at line 9, indent 1
+        assert lines[4].split(": ", 1)[1] == "  async def async_method(self)"
+
+    def test_async_def_functions(self, tmp_path):
+        """async def functions are shown with the 'async def' prefix."""
+        f = tmp_path / "async_mod.py"
+        f.write_text("""\
+async def fetch(url):
+    pass
+""")
+        result = outline("async_mod.py", tmp_path)
+        assert "async def fetch(url)" in result
+
+    def test_function_args_with_defaults_and_varargs(self, tmp_path):
+        """Functions with defaults, *args, and **kwargs are shown correctly."""
+        f = tmp_path / "args_mod.py"
+        f.write_text("""\
+def complex(a, b=1, *args, c=2, **kwargs):
+    pass
+""")
+        result = outline("args_mod.py", tmp_path)
+        # Should show a, b=1, *args, c=2, **kwargs
+        assert "def complex(a, b=1, *args, c=2, **kwargs)" in result
+
+    def test_function_default_values_repr(self, tmp_path):
+        """Default values are displayed using ast.unparse / repr."""
+        f = tmp_path / "defaults.py"
+        f.write_text('''\
+def f(a=42, b="hello", c=None, d=True):
+    pass
+''')
+        result = outline("defaults.py", tmp_path)
+        assert 'a=42' in result
+        assert "b='hello'" in result or 'b="hello"' in result
+        assert 'c=None' in result
+        assert 'd=True' in result
+
+    def test_class_with_bases(self, tmp_path):
+        """Classes show parent classes in parentheses."""
+        f = tmp_path / "bases.py"
+        f.write_text("""\
+class Child(Parent, Mixin):
+    pass
+""")
+        result = outline("bases.py", tmp_path)
+        assert "class Child(Parent, Mixin)" in result
+
+    def test_syntax_error_returns_message_not_crash(self, tmp_path):
+        """A Python file with a syntax error returns a clear error message."""
+        f = tmp_path / "broken.py"
+        f.write_text("def broken(\n")  # incomplete definition
+        result = outline("broken.py", tmp_path)
+        assert result.startswith("Error: syntax error")
+        assert "broken.py" in result
+
+    def test_empty_file(self, tmp_path):
+        """An empty file returns '(no definitions found)'."""
+        f = tmp_path / "empty.py"
+        f.write_text("")
+        result = outline("empty.py", tmp_path)
+        assert result == "(no definitions found)"
+
+    # ---- Non-Python files ---------------------------------------------------
+
+    def test_non_python_def_like_lines(self, tmp_path):
+        """A .js file with function/class/etc. lines matches the regex fallback."""
+        f = tmp_path / "script.js"
+        f.write_text("""\
+function foo() {
+}
+
+class Bar {
+    public method() {}
+}
+
+export const x = 1;
+fn helper() {}
+""")
+        result = outline("script.js", tmp_path)
+        lines = result.splitlines()
+        # Check each definition-like line
+        assert any("function foo()" in l for l in lines)
+        assert any("class Bar" in l for l in lines)
+        assert any("public method()" in l for l in lines)
+        assert any("export const" in l for l in lines)
+        assert any("fn helper()" in l for l in lines)
+        # Each line starts with "lineno: "
+        for line in lines:
+            assert ":" in line
+
+    def test_non_python_file_keywords(self, tmp_path):
+        """A .txt file with various definition keywords is captured."""
+        f = tmp_path / "notes.txt"
+        f.write_text("""\
+def my_func()
+class MyClass
+function helper(x)
+fn short
+func go_func
+public static void main
+private int x
+protected void finalize
+export default
+""")
+        result = outline("notes.txt", tmp_path)
+        lines = result.splitlines()
+        assert len(lines) == 9
+
+    def test_non_python_empty_file(self, tmp_path):
+        """An empty non-Python file returns '(no definitions found)'."""
+        f = tmp_path / "empty.txt"
+        f.write_text("")
+        result = outline("empty.txt", tmp_path)
+        assert result == "(no definitions found)"
+
+    # ---- Error handling -----------------------------------------------------
+
+    def test_directory_path_returns_error(self, tmp_path):
+        """Passing a directory path returns an error."""
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+        result = outline("subdir", tmp_path)
+        assert "directory" in result.lower()
+        assert "Error" in result
+
+    def test_path_outside_root_raises_path_error(self, tmp_path):
+        """A path that escapes the sandbox raises PathError."""
+        root = tmp_path / "sandbox"
+        root.mkdir()
+        outside = tmp_path / "secret.py"
+        outside.write_text("x = 1")
+        with pytest.raises(PathError, match="outside the project root"):
+            outline("../secret.py", root)
+
+    def test_nonexistent_file_returns_error(self, tmp_path):
+        """A nonexistent file returns an error message."""
+        result = outline("no_such_file.py", tmp_path)
+        assert "not a file" in result
+        assert "Error" in result
+
+    # ---- Dispatch integration -----------------------------------------------
+
+    def test_dispatch_outline(self, tmp_path):
+        """dispatch('outline', ...) routes correctly."""
+        f = tmp_path / "dispatch_test.py"
+        f.write_text("def foo():\n    pass\n")
+        result = dispatch("outline", {"path": "dispatch_test.py"}, tmp_path)
+        assert "def foo()" in result
+
+    def test_dispatch_outline_non_python(self, tmp_path):
+        """dispatch to outline works for non-Python files too."""
+        f = tmp_path / "dispatch_test.js"
+        f.write_text("function main() {\n}\n")
+        result = dispatch("outline", {"path": "dispatch_test.js"}, tmp_path)
+        assert "function main()" in result

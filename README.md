@@ -201,6 +201,19 @@ DEVBOT_MODEL=deepseek-v4-flash
 
 Real environment variables take precedence over `.env`. Add `.env` to your `.gitignore`.
 
+You can also put these settings in a `.devbot/config.toml` file in your project root:
+
+```toml
+# .devbot/config.toml (all keys optional)
+model = "deepseek-v4-pro"
+max_parallel = 4
+token_budget = 100000
+loop_limit = 5
+```
+
+Precedence: **environment variables** > `.env` file > `.devbot/config.toml` > defaults.
+Missing or malformed config files are silently ignored.
+
 ## Safety model
 
 DevBot is designed to be safe by default:

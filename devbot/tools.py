@@ -1,15 +1,22 @@
 """Tool implementations and JSON schemas exposed to the model."""
 
+import ast
+import difflib
 import fnmatch
 import locale
 import os
 import py_compile
 import re
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 MAX_OUTPUT = 50_000  # chars returned to the model per tool call
+
+_BACKUPS_DIR = ".devbot/backups"
+_MAX_BACKUP_SETS = 20
 
 # Directories skipped by recursive walks (grep, find_files) and listings.
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
@@ -204,6 +211,31 @@ def _clip(text: str) -> str:
     return text
 
 
+DIFF_CLIP = 2000   # chars of unified diff returned to the model
+
+
+def _compute_diff(old_content: str, new_content: str, filename: str) -> str:
+    """Return a fenced ```diff block showing the unified diff, or a minimal note."""
+    old_lines = old_content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+
+    diff_lines = list(difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"a/{filename}", tofile=f"b/{filename}",
+    ))
+
+    if not diff_lines:
+        return "(no changes)"
+
+    diff_text = "".join(diff_lines)
+    full_block = f"```diff\n{diff_text}```"
+
+    if len(full_block) > DIFF_CLIP:
+        full_block = full_block[:DIFF_CLIP] + "\n... [diff truncated]"
+
+    return full_block
+
+
 def _resolve(path: str, root: Path) -> Path:
     """Resolve path against root and ensure it stays inside root.
 
@@ -244,11 +276,76 @@ def read_file(path: str, root: Path, offset: int = 0, limit: int = 2000) -> str:
     return _clip(numbered)
 
 
+def _backup_file(root: Path, file_path: Path, old_content: str) -> None:
+    """Save a backup of *file_path* before it is modified."""
+    ts = str(time.time_ns())
+    backup_dir = root / _BACKUPS_DIR / ts
+    rel = file_path.relative_to(root)
+    (backup_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+    (backup_dir / rel).write_text(old_content, encoding="utf-8")
+    _prune_backups(root)
+
+
+def _prune_backups(root: Path) -> None:
+    """Keep only the most recent _MAX_BACKUP_SETS backup folders."""
+    backups_root = root / _BACKUPS_DIR
+    if not backups_root.is_dir():
+        return
+    dirs = sorted(
+        [d for d in backups_root.iterdir() if d.is_dir()],
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    for old in dirs[_MAX_BACKUP_SETS:]:
+        shutil.rmtree(old)
+
+
+def undo_last_edit(root: Path) -> str:
+    """Restore files from the most recent backup set and remove it."""
+    backups_root = root / _BACKUPS_DIR
+    if not backups_root.is_dir():
+        return "No backups found."
+    dirs = sorted(
+        [d for d in backups_root.iterdir() if d.is_dir()],
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    if not dirs:
+        return "No backups found."
+    latest = dirs[0]
+    restored = []
+    for f in sorted(latest.rglob("*")):
+        if f.is_file():
+            rel = f.relative_to(latest)
+            target = root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
+            restored.append(str(rel))
+    shutil.rmtree(latest)
+    if not restored:
+        return "Backup set was empty; nothing to restore."
+    lines = [f"Restored {len(restored)} file(s) from backup:"]
+    for r in restored:
+        lines.append(f"  {r}")
+    return "\n".join(lines)
+
+
 def write_file(path: str, content: str, root: Path) -> str:
     p = _resolve(path, root)
     p.parent.mkdir(parents=True, exist_ok=True)
+    existed = p.is_file()
+    old_content = p.read_text(encoding="utf-8", errors="replace") if existed else None
+    if existed:
+        _backup_file(root, p, old_content)
     p.write_text(content, encoding="utf-8")
-    return f"Wrote {len(content)} chars to {p}"
+    msg = f"Wrote {len(content)} chars to {p}"
+    if existed:
+        diff = _compute_diff(old_content, content, str(p))
+        msg += "\n" + diff
+    else:
+        lines = content.count("\n") + (0 if content.endswith("\n") else 1)
+        msg += f"\n({lines} lines, new file)"
+    return msg
 
 
 def edit_file(path: str, old_string: str, new_string: str, root: Path,
@@ -272,9 +369,11 @@ def edit_file(path: str, old_string: str, new_string: str, root: Path,
         return "Error: old_string not found in file (check exact whitespace/indentation)." + hint
     if count > 1 and not replace_all:
         return f"Error: old_string occurs {count} times; make it unique or set replace_all"
-    text = text.replace(old_string, new_string, -1 if replace_all else 1)
-    p.write_text(text, encoding="utf-8")
-    return f"Replaced {count if replace_all else 1} occurrence(s) in {p}"
+    new_text = text.replace(old_string, new_string, -1 if replace_all else 1)
+    _backup_file(root, p, text)
+    p.write_text(new_text, encoding="utf-8")
+    diff = _compute_diff(text, new_text, str(p))
+    return f"Replaced {count if replace_all else 1} occurrence(s) in {p}\n" + diff
 
 
 def list_dir(path: str, root: Path) -> str:
@@ -310,7 +409,7 @@ def grep(pattern: str, root: Path, path: str = ".", glob: str = "",
             try:
                 for n, line in enumerate(fp.read_text(encoding="utf-8").splitlines(), 1):
                     if rx.search(line):
-                        hits.append(f"{str(fp.relative_to(base)).replace('\\', '/')}:{n}: {line.strip()}")
+                        hits.append(f"{rel}:{n}: {line.strip()}")
                         if len(hits) >= 200:
                             return _clip("\n".join(hits) + "\n... [stopped at 200 matches]")
             except (UnicodeDecodeError, PermissionError, OSError):
@@ -523,6 +622,221 @@ def verify(root: Path) -> str:
     return f"INFO: No test framework detected. Syntax-checked {checked} Python files -- no errors."
 
 
+# ---- outline helper: regex for non-Python definition-like lines ----
+_OUTLINE_RE = re.compile(
+    r"^\s*(def|class|function|fn|func|public|private|protected|export)\b"
+)
+
+
+def _build_func_sig(node: ast.AST) -> str:
+    """Build a parameter signature string from an AST function node.
+
+    Uses ``ast.unparse`` for default values (Python ≥3.9).  Falls back to
+    ``repr`` when ``ast.unparse`` is not available.
+    """
+    args = node.args
+    parts: list[str] = []
+
+    _unparse = getattr(ast, "unparse", None)
+
+    def _dump(val):
+        if _unparse is not None:
+            try:
+                return _unparse(val)
+            except Exception:
+                pass
+        return repr(val)
+
+    # Positional-only args (Python ≥3.8)
+    posonly = getattr(args, "posonlyargs", None) or []
+    # defaults are right-aligned against the combined posonly + args list
+    total_positional = len(posonly) + len(args.args)
+    num_no_default = total_positional - len(args.defaults)
+    for i, arg in enumerate(posonly):
+        if i >= num_no_default:
+            d = _dump(args.defaults[i - num_no_default])
+            parts.append(f"{arg.arg}={d}")
+        else:
+            parts.append(arg.arg)
+    if posonly:
+        parts.append("/")
+
+    # Positional-or-keyword args
+    for i, arg in enumerate(args.args):
+        global_i = len(posonly) + i
+        if global_i >= num_no_default:
+            d = _dump(args.defaults[global_i - num_no_default])
+            parts.append(f"{arg.arg}={d}")
+        else:
+            parts.append(arg.arg)
+
+    # *args
+    if args.vararg:
+        parts.append(f"*{args.vararg.arg}")
+    elif args.kwonlyargs:
+        # bare * separator when there are keyword-only args but no *args
+        parts.append("*")
+
+    # Keyword-only args
+    kw_defaults = args.kw_defaults if args.kw_defaults else []
+    for i, arg in enumerate(args.kwonlyargs):
+        if i < len(kw_defaults) and kw_defaults[i] is not None:
+            d = _dump(kw_defaults[i])
+            parts.append(f"{arg.arg}={d}")
+        else:
+            parts.append(arg.arg)
+
+    # **kwargs
+    if args.kwarg:
+        parts.append(f"**{args.kwarg.arg}")
+
+    return "(" + ", ".join(parts) + ")"
+
+
+def _walk_defs(body: list[ast.AST], indent: int = 0) -> list[str]:
+    """Recursively walk AST body, yielding outline lines with 2-space nesting."""
+    lines: list[str] = []
+    prefix = " " + "  " * indent  # " " + 2 spaces per nesting level
+    for node in body:
+        if isinstance(node, ast.FunctionDef):
+            sig = _build_func_sig(node)
+            lines.append(f"{node.lineno}:{prefix}def {node.name}{sig}")
+        elif isinstance(node, ast.AsyncFunctionDef):
+            sig = _build_func_sig(node)
+            lines.append(f"{node.lineno}:{prefix}async def {node.name}{sig}")
+        elif isinstance(node, ast.ClassDef):
+            bases = ""
+            if node.bases:
+                try:
+                    bases = "(" + ", ".join(ast.unparse(b) for b in node.bases) + ")"
+                except Exception:
+                    bases = "(" + ", ".join(repr(b) for b in node.bases) + ")"
+            lines.append(f"{node.lineno}:{prefix}class {node.name}{bases}")
+            lines.extend(_walk_defs(node.body, indent + 1))
+    return lines
+
+
+def _outline_python(p: Path) -> str:
+    """Parse a Python file with ``ast`` and return a nested definition outline."""
+    try:
+        source = p.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        return f"Error: syntax error in {p}: {e.msg}"
+    except Exception as e:
+        return f"Error: {e}"
+
+    lines = _walk_defs(tree.body)
+    return "\n".join(lines) if lines else "(no definitions found)"
+
+
+def _outline_regex(p: Path) -> str:
+    """Fallback outline for non-Python files using a regex over source lines."""
+    try:
+        text_lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception as e:
+        return f"Error: {e}"
+
+    result = []
+    for i, line in enumerate(text_lines, 1):
+        if _OUTLINE_RE.match(line):
+            result.append(f"{i}: {line.strip()}")
+    return "\n".join(result) if result else "(no definitions found)"
+
+
+def tree(path: str, root: Path, max_depth: int = 3) -> str:
+    """Render an indented directory tree starting at *path*.
+
+    Uses Unicode box-drawing characters (├── └── │).  The starting directory
+    is shown as a header line (depth 0); its direct children are depth 1, and
+    so on up to *max_depth* levels of nesting below the start.
+
+    * Directories listed in ``SKIP_DIRS`` are pruned during traversal.
+    * ``.gitignore`` patterns (parsed from *root*) are respected — relative
+      paths are computed from *root* for matching.
+    * Total entries (files + directories) is capped at 500 with a truncation
+      note.
+    * If *path* is not a directory, an error string is returned.
+    * The final output is passed through ``_clip``.
+    """
+    p = _resolve(path, root)
+    if not p.is_dir():
+        return f"Error: {p} is not a directory"
+
+    file_pats, dir_pats = _parse_gitignore(root)
+
+    lines: list[str] = [str(p)]
+    entry_count: list[int] = [0]   # mutable so nested _walk can mutate
+    truncated: list[bool] = [False]
+
+    def _walk(dir_path: Path, depth: int, prefix: str) -> None:
+        if depth > max_depth or truncated[0]:
+            return
+
+        try:
+            entries = sorted(dir_path.iterdir(),
+                             key=lambda x: (x.is_dir(), x.name.lower()))
+        except (PermissionError, OSError):
+            return
+
+        # Filter out SKIP_DIRS and gitignored entries.
+        filtered: list[Path] = []
+        for e in entries:
+            if e.name in SKIP_DIRS:
+                continue
+            # Compute path relative to *root* for gitignore checks.
+            try:
+                rel = str(e.relative_to(root)).replace("\\", "/")
+            except ValueError:
+                rel = str(e)
+            if _is_gitignored(rel, file_pats, dir_pats):
+                continue
+            filtered.append(e)
+
+        for i, e in enumerate(filtered):
+            if entry_count[0] >= 500:
+                truncated[0] = True
+                return
+
+            is_last = (i == len(filtered) - 1)
+            connector = "└── " if is_last else "├── "
+            entry_count[0] += 1
+            suffix = "/" if e.is_dir() else ""
+            lines.append(prefix + connector + e.name + suffix)
+
+            if e.is_dir():
+                child_prefix = prefix + ("    " if is_last else "│   ")
+                _walk(e, depth + 1, child_prefix)
+
+    _walk(p, 1, "")
+
+    if truncated[0]:
+        lines.append("... [truncated at 500 entries]")
+
+    return _clip("\n".join(lines))
+
+
+def outline(path: str, root: Path) -> str:
+    """Return an outline of top-level and nested class/function definitions in a file.
+
+    Python files (``.py``) are parsed with the stdlib ``ast`` module, yielding
+    each definition with its line number, nesting-aware indentation, and
+    signature.  Non-Python files fall back to a regex that matches lines
+    starting with ``def``, ``class``, ``function``, ``fn``, ``func``,
+    ``public``, ``private``, ``protected``, or ``export``.
+    """
+    p = _resolve(path, root)
+    if not p.is_file():
+        if p.is_dir():
+            return f"Error: {p} is a directory, not a file"
+        return f"Error: {p} is not a file"
+
+    if p.suffix.lower() == ".py":
+        return _outline_python(p)
+    else:
+        return _outline_regex(p)
+
+
 # JSON schemas sent to DeepSeek (OpenAI function-calling format)
 TOOL_SCHEMAS = [
     {
@@ -581,6 +895,21 @@ TOOL_SCHEMAS = [
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string", "description": "Directory path, default project root"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tree",
+            "description": "Render an indented directory tree. Prunes hidden/skipped directories and gitignored entries.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path"},
+                    "max_depth": {"type": "integer", "description": "Maximum depth of nesting to show (default 3)", "default": 3},
+                },
+                "required": ["path"],
             },
         },
     },
@@ -650,6 +979,20 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "outline",
+            "description": "Return an outline of top-level and nested class/function definitions in a file. Python files are parsed with AST; non-Python files use a definition regex.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path (relative to project root or absolute)"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "verify",
             "description": "Auto-detect the project's test framework (pytest, npm test, cargo test, go test, etc.), run tests, and report results. Use after making changes to verify they work.",
             "parameters": {
@@ -658,10 +1001,22 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "undo_last_edit",
+            "description": "Restore files from the most recent edit backup. Reverts the last write_file or edit_file operation.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
 ]
 
 # Tools that mutate state or execute code -> require confirmation unless auto-approved
-DANGEROUS_TOOLS = {"write_file", "edit_file", "run_command", "verify"}
+DANGEROUS_TOOLS = {"write_file", "edit_file", "run_command", "verify", "undo_last_edit"}
 
 # Dict-based dispatch: maps tool name -> handler(args, root).
 # Null-safe arg.get(key) or default handles JSON null coercion (P1-11).
@@ -672,6 +1027,7 @@ _TOOL_HANDLERS = {
     "edit_file": lambda a, r: edit_file(
         a["path"], a["old_string"], a["new_string"], r, a.get("replace_all") or False),
     "list_dir": lambda a, r: list_dir(a.get("path") or ".", r),
+    "tree": lambda a, r: tree(a["path"], r, a.get("max_depth") if a.get("max_depth") is not None else 3),
     "grep": lambda a, r: grep(
         a["pattern"], r, a.get("path") or ".", a.get("glob") or "",
         a.get("respect_gitignore", True)),
@@ -683,6 +1039,8 @@ _TOOL_HANDLERS = {
     "web_search": lambda a, r: web_search(
         a["query"], a.get("max_results") or 5),
     "verify": lambda a, r: verify(r),
+    "outline": lambda a, r: outline(a["path"], r),
+    "undo_last_edit": lambda a, r: undo_last_edit(r),
 }
 
 
