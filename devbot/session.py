@@ -6,6 +6,7 @@ listing saved sessions and resuming the latest or a specific session.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
@@ -36,12 +37,20 @@ def _ensure_dir(root: Path) -> Path:
     return d
 
 
+_id_counter = itertools.count()
+
+
 def _make_session_id() -> str:
-    """Generate a unique session id from the current UTC timestamp."""
+    """Generate a unique session id.
+
+    Uses a UTC timestamp plus a process-wide counter and random suffix so IDs
+    are unique even on platforms with coarse clock resolution (e.g. Windows,
+    where time.time() granularity is ~16ms and rapid calls would otherwise
+    collide).
+    """
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    # Add microseconds for uniqueness within the same second
-    micro = f"{int(time.time() * 1_000_000) % 1_000_000:06d}"
-    return f"{SESSION_PREFIX}{ts}-{micro}"
+    uniq = f"{next(_id_counter):04d}{os.urandom(2).hex()}"
+    return f"{SESSION_PREFIX}{ts}-{uniq}"
 
 
 def _session_path(root: Path, session_id: str) -> Path:

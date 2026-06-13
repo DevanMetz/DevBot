@@ -4,8 +4,15 @@ Precedence: real environment variables > .env file > config.toml > defaults.
 """
 
 import os
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # Python 3.10
+    try:
+        import tomli as tomllib  # type: ignore
+    except ModuleNotFoundError:
+        tomllib = None  # no TOML parser available; config file is skipped
 
 # Mapping from config.toml keys to their corresponding env var names.
 _CONFIG_KEY_MAP: dict[str, str] = {
@@ -35,6 +42,8 @@ def load_project_config(root: Path) -> None:
     """
     global _project_config
     _project_config.clear()
+    if tomllib is None:  # no TOML parser on this interpreter
+        return
     config_path = root / ".devbot" / "config.toml"
     if not config_path.is_file():
         return

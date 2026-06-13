@@ -25,12 +25,13 @@ class TestSessionIdAndPaths:
     def test_make_session_id_format(self):
         sid = _make_session_id()
         assert sid.startswith(SESSION_PREFIX)
-        # Should be like: session-20250115-143022-123456
+        # Should be like: session-20250115-143022-0000ab12
+        # (date, time, then a counter+random uniqueness suffix)
         parts = sid[len(SESSION_PREFIX):].split("-")
-        assert len(parts) == 3  # date, time, micros
-        assert len(parts[0]) == 8  # YYYYMMDD
-        assert len(parts[1]) == 6  # HHMMSS
-        assert len(parts[2]) == 6  # micros
+        assert len(parts) == 3  # date, time, uniqueness suffix
+        assert len(parts[0]) == 8 and parts[0].isdigit()  # YYYYMMDD
+        assert len(parts[1]) == 6 and parts[1].isdigit()  # HHMMSS
+        assert parts[2] and parts[2].isalnum()  # counter + random hex
 
     def test_sessions_dir(self, tmp_path):
         assert _sessions_dir(tmp_path) == tmp_path / SESSIONS_DIR
