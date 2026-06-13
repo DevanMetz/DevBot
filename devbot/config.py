@@ -22,6 +22,11 @@ _CONFIG_KEY_MAP: dict[str, str] = {
     "global_budget": "DEVBOT_GLOBAL_BUDGET",
     "loop_limit": "DEVBOT_LOOP_LIMIT",
     "compress_model": "DEVBOT_COMPRESS_MODEL",
+    "verbosity": "DEVBOT_VERBOSITY",
+    "max_tool_output": "DEVBOT_MAX_TOOL_OUTPUT",
+    "read_file_limit": "DEVBOT_READ_FILE_LIMIT",
+    "diff_clip": "DEVBOT_DIFF_CLIP",
+    "specialist_result_limit": "DEVBOT_SPECIALIST_RESULT_LIMIT",
     "mega_warn_threshold": "DEVBOT_MEGA_WARN_THRESHOLD",
     "pipeline_rounds": "DEVBOT_PIPELINE_ROUNDS",
 }

@@ -40,6 +40,24 @@ def parse_phases(plan_text: str) -> list[dict]:
     return phases
 
 
+def _plan_outline(phases: list[dict]) -> str:
+    """Compact phase list used instead of resending the entire plan each time."""
+    return "\n".join(f"{i}. {ph['title']}" for i, ph in enumerate(phases, 1))
+
+
+def _phase_prompt(phases: list[dict], index: int) -> str:
+    """Build a compact implementation prompt for one phase."""
+    phase = phases[index]
+    return (
+        "You are implementing one phase of a multi-phase plan.\n\n"
+        f"=== PLAN OUTLINE ===\n{_plan_outline(phases)}\n\n"
+        f"=== IMPLEMENT ONLY PHASE {index + 1} NOW ===\n{phase['body']}\n\n"
+        "Use the `pipeline` tool for every code change (it enforces review). "
+        "Do not start other phases. When finished, make sure the test suite "
+        "passes."
+    )
+
+
 def _run_tests(root: Path) -> tuple[bool, str]:
     """Run the project's pytest suite. Returns (passed, tail_of_output)."""
     try:
@@ -90,14 +108,7 @@ def run_plan(root: Path, plan_path: str = "plan.md", model: str | None = None,
         print(f"\n\x1b[36;1m{'='*70}\n[autopilot] PHASE {idx}/{len(phases)}: "
               f"{ph['title']}\n{'='*70}\x1b[0m")
 
-        _agent().run(
-            f"You are implementing one phase of a multi-phase plan.\n\n"
-            f"=== FULL PLAN (for context) ===\n{plan_text}\n\n"
-            f"=== IMPLEMENT ONLY THIS PHASE NOW ===\n{ph['body']}\n\n"
-            "Use the `pipeline` tool for every code change (it enforces review). "
-            "Do not start other phases. When finished, make sure the test suite "
-            "passes."
-        )
+        _agent().run(_phase_prompt(phases, idx - 1))
 
         ok, out = _run_tests(root)
         if not ok:

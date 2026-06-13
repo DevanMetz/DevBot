@@ -105,6 +105,16 @@ Guidelines:
 - Never run destructive commands (rm -rf, force push, etc.) without explaining why first.
 """
 
+CONCISE_ADDENDUM = """\
+
+Token-efficiency mode is active.
+- Keep replies short: answer first, then only essential details.
+- Avoid preamble, repetition, hedging, and long status narration.
+- Prefer compact bullets over paragraphs when reporting several facts.
+- Do not paste long command output or file contents; cite the relevant file/line or summarize.
+- For long tasks, keep a tiny working summary of decisions and next actions.
+"""
+
 MANAGER_ADDENDUM = """\
 
 You are running as the MANAGER of an agent swarm. In addition to your own tools,
@@ -222,6 +232,9 @@ class Agent:
                 prompt += MANAGER_ADDENDUM + MEGASWARM_ADDENDUM
             elif swarm:
                 prompt += MANAGER_ADDENDUM
+        if os.environ.get("DEVBOT_VERBOSITY", "").lower() in (
+                "concise", "terse", "compact", "caveman"):
+            prompt += CONCISE_ADDENDUM
         self.messages: list[dict] = [{"role": "system", "content": prompt}]
 
     # ---- UI hooks (overridden/used by cli.py) -------------------------------

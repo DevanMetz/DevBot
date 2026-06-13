@@ -16,6 +16,7 @@ task is done.
 - **Cost estimation** — live USD cost estimate based on per-model pricing.
 - **Structured JSONL logging** — set `DEVBOT_LOG` to a file path for timestamped tool-call and turn logs.
 - **Global token budget** — process-wide cap (`DEVBOT_GLOBAL_BUDGET`) shared across all swarm agents.
+- **Token-efficiency mode** — compact prompts, smaller tool returns, and clipped agent handoffs for long runs.
 - **Approval gates** — writes, shell commands, and test runs require confirmation (`y` / `a`lways / decline).
 - **Sandboxed file access** — tools cannot read or write outside the project root.
 - **Swarm mode** — a manager agent can delegate subtasks to specialist sub-agents.
@@ -185,18 +186,28 @@ integrates the results.
 | `DEVBOT_TOKEN_BUDGET` | Per-agent token cap (0 = unlimited) | 0 |
 | `DEVBOT_GLOBAL_BUDGET` | Process-wide token cap (0 = unlimited) | 0 |
 | `DEVBOT_COMPRESS_MODEL` | Model used for context compression | `deepseek-v4-flash` |
+| `DEVBOT_VERBOSITY` | Set to `concise`, `terse`, `compact`, or `caveman` for shorter agent replies | normal |
+| `DEVBOT_MAX_TOOL_OUTPUT` | Max chars returned to the model per tool call | 50000 |
+| `DEVBOT_READ_FILE_LIMIT` | Default line count for `read_file` when no limit is passed | 2000 |
+| `DEVBOT_DIFF_CLIP` | Max chars of edit diff returned to the model | 2000 |
+| `DEVBOT_SPECIALIST_RESULT_LIMIT` | Max chars returned from one specialist/pipeline handoff | 8000 |
 | `DEVBOT_MEGA_WARN_THRESHOLD` | Warn when N > threshold in megadelegate | 5 |
 | `DEVBOT_PIPELINE_ROUNDS` | Max review→fix rounds in pipeline | 2 |
 | `DEVBOT_SHOW_REASONING` | Show chain-of-thought (`1`, `true`, `yes`) | off |
 | `DEVBOT_ALLOW_SHELL` | Skip shell approval for allow-listed commands (`1`, `true`) | off |
 | `DEVBOT_LOG` | Path for JSONL structured log | off (no logging) |
 | `DEVBOT_LOOP_LIMIT` | Consecutive identical tool calls / errors before halting (0 = off) | 3 |
+| `DEVBOT_EVOLVE_MAX_PHASES` | Max phases per auto-evolve run | 20 |
+| `DEVBOT_EVOLVE_TIME_LIMIT` | Max minutes per auto-evolve run (0 = unlimited) | 0 |
 
 You can also put these in a `.env` file in your project root instead of exporting them:
 
 ```
 DEEPSEEK_API_KEY=sk-...
 DEVBOT_MODEL=deepseek-v4-flash
+DEVBOT_VERBOSITY=concise
+DEVBOT_MAX_TOOL_OUTPUT=12000
+DEVBOT_SPECIALIST_RESULT_LIMIT=4000
 ```
 
 Real environment variables take precedence over `.env`. Add `.env` to your `.gitignore`.
@@ -209,6 +220,9 @@ model = "deepseek-v4-pro"
 max_parallel = 4
 token_budget = 100000
 loop_limit = 5
+verbosity = "concise"
+max_tool_output = 12000
+specialist_result_limit = 4000
 ```
 
 Precedence: **environment variables** > `.env` file > `.devbot/config.toml` > defaults.

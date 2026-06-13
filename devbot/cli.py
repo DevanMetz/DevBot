@@ -124,6 +124,10 @@ def main():
                         help="Autopilot: implement each '## Phase' of PLAN (default "
                              "plan.md) one at a time, verifying between phases. "
                              "Runs unattended (implies auto-approve).")
+    parser.add_argument("--auto-evolve", action="store_true",
+                        help="Self-evolving autopilot: generate plans, critique them, "
+                             "implement surviving phases on a dedicated git branch. "
+                             "Runs unattended (implies auto-approve and megaswarm).")
     parser.add_argument("--version", action="version", version=f"devbot {__version__}")
     args = parser.parse_args()
 
@@ -135,6 +139,16 @@ def main():
         print("\x1b[33m[devbot] Autopilot runs unattended with auto-approve and "
               "shell access. Ctrl+C to stop.\x1b[0m")
         ok = run_plan(root, args.run_plan, model=args.model)
+        sys.exit(0 if ok else 1)
+
+    # Autopilot: self-evolving loop that plans, critiques, and implements unattended.
+    if args.auto_evolve:
+        from .evolve import run_evolve
+        print("\x1b[33m[devbot] Auto-evolve runs UNATTENDED on a dedicated git branch "
+              "with auto-approve and shell access. It will plan, critique, and "
+              "implement phases, committing each green one. NEVER runs on main/master. "
+              "Ctrl+C to stop.\x1b[0m")
+        ok = run_evolve(root, args.model)
         sys.exit(0 if ok else 1)
 
     # Handle --resume: restore from a saved session.
