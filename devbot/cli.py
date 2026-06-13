@@ -82,10 +82,23 @@ def main():
                         help="Megaswarm mode: delegates 3 agents in parallel + reviewer synthesis")
     parser.add_argument("-r", "--resume", nargs="?", const="latest", metavar="ID",
                         help="Resume a saved session (latest if no ID given)")
+    parser.add_argument("--run-plan", nargs="?", const="plan.md", default=None,
+                        metavar="PLAN",
+                        help="Autopilot: implement each '## Phase' of PLAN (default "
+                             "plan.md) one at a time, verifying between phases. "
+                             "Runs unattended (implies auto-approve).")
     parser.add_argument("--version", action="version", version=f"devbot {__version__}")
     args = parser.parse_args()
 
     root = Path(args.cwd).resolve()
+
+    # Autopilot: run a whole plan unattended, phase by phase.
+    if args.run_plan is not None:
+        from .autopilot import run_plan
+        print("\x1b[33m[devbot] Autopilot runs unattended with auto-approve and "
+              "shell access. Ctrl+C to stop.\x1b[0m")
+        ok = run_plan(root, args.run_plan, model=args.model)
+        sys.exit(0 if ok else 1)
 
     # Handle --resume: restore from a saved session.
     if args.resume is not None:

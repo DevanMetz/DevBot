@@ -1,114 +1,119 @@
-# DevBot self-improvement plan
+# DevBot improvement plan (autopilot-ready)
 
-Phases are independent and ordered by value. After each phase: run
-`python -m pytest -q` (once Phase 1 lands) plus a syntax/compile check, and
-verify before moving on. Prefer `deepseek-v4-flash` while developing to keep
-cost down. Commit after each phase.
+Each `## Phase` below is independent and self-contained — run them with
+`devbot --run-plan plan.md`. After each phase the test suite must pass, so
+**every phase MUST add or update tests** under `tests/` and leave `pytest -q`
+green. Use the `pipeline` tool for all code changes. Do not start a phase other
+than the one assigned. Keep changes small and focused.
+
+These are genuinely pending items — the test suite, CI, shell sandbox, session
+persistence, cost controls, megaswarm pipeline/divide-and-conquer, the live
+dashboard, and reasoning suppression already exist; do not redo them.
 
 ---
 
-## Phase 1 — Make the project testable (do first)
+## Phase 1 — Recursive glob (`**`) in grep and find_files
 
-The project has `tests/` but no test runner config, and the core file-mutating
-logic is almost entirely untested. Lock it down before changing anything else.
+`grep` and `find_files` in `devbot/tools.py` match filenames with
+`Path(name).match(glob)`, which does NOT support `**` recursive patterns or
+path-segment globs like `src/**/*.py`. They already walk recursively, but the
+glob only ever sees the bare filename.
 
 **What to do:**
-- Add `pytest` to `pyproject.toml` as an optional `[dev]` dependency and a
-  `[tool.pytest.ini_options]` section (`testpaths = ["tests"]`).
-- Write unit tests (no network) for the high-risk pure logic in `tools.py`:
-  - `_resolve`: relative path inside root OK; `..` escape and absolute paths
-    outside root raise `PathError`; symlink escape blocked.
-  - `edit_file`: empty `old_string`, missing string (with closest-line hint),
-    non-unique without `replace_all`, successful single + `replace_all`.
-  - `read_file`: negative offset clamps, offset past EOF errors, truncation
-    header appears only when content is clipped.
-  - `grep` / `find_files`: `SKIP_DIRS` pruning; match caps.
-  - `run_command`: `BLOCKED_PATTERNS` rejects dangerous commands.
-  - `dispatch`: unknown tool, null-coerced args.
-- Add tests for `agent._compress_conversation` keep-index logic (no orphaned
-  tool messages) and `_load_dotenv`.
-- Add a GitHub Actions workflow (`.github/workflows/ci.yml`) that runs
-  `pytest -q` on push/PR (Python 3.10–3.13).
+- Make the `glob` argument support both bare-name patterns (`*.py`) and
+  path-relative recursive patterns (`**/*.py`, `devbot/*.py`).
+- Implement by matching the path **relative to the search base** with `fnmatch`
+  (translate `**` appropriately) or `pathlib.PurePath.full_match` if available;
+  fall back to filename matching when the pattern has no `/`.
+- Keep the existing `SKIP_DIRS` pruning and result caps unchanged.
+- Update the tool schema descriptions for `grep`/`find_files` to mention `**`.
 
-**Done when:** `pytest -q` passes locally and the CI workflow is committed.
+**Done when:** `find_files("**/*.py")` and `grep(pattern, glob="devbot/*.py")`
+match nested paths correctly, plain `*.py` still works, and new tests in
+`tests/` cover both bare and recursive patterns. `pytest -q` green.
 
 ---
 
-## Phase 2 — Harden the shell sandbox
+## Phase 2 — Optional structured logging (`DEVBOT_LOG`)
 
-`run_command` uses `shell=True` gated only by a regex blocklist — a deny-list is
-the wrong default. Move toward an allow-list / explicit-confirmation model.
+There is no machine-readable record of what DevBot did — only the pretty
+terminal output.
 
 **What to do:**
-- Add a `DEVBOT_ALLOW_SHELL` posture: default to requiring per-command approval
-  even in `-y` mode for commands not on a safe allow-list (git status, ls,
-  pytest, python, npm test, etc.).
-- Surface the full command in the approval prompt (already partly there) and
-  show *why* it was flagged (matched blocklist vs. not on allow-list).
-- Fix the Windows encoding bug: `run_command` decodes subprocess output as UTF-8
-  but `cmd.exe` emits cp1252 — detect the console encoding or use
-  `errors="replace"` consistently and document the limitation.
-- Add tests for the allow-list / block-list decision logic.
+- Add a small logging helper (e.g. `devbot/devlog.py`) that, when the env var
+  `DEVBOT_LOG` is set to a file path, appends one JSON object per line (JSONL)
+  for: each tool call (name, args summary, result length, ok/error) and each
+  assistant turn (model, prompt tokens, total tokens).
+- Wire it into the tool-dispatch path in `devbot/agent.py` behind the env var so
+  there is zero overhead and no behavior change when unset.
+- Never log secrets: redact any value that looks like an API key.
 
-**Done when:** a non-allow-listed command prompts even under `-y`; allow-listed
-ones run freely; tests cover the decision matrix.
+**Done when:** with `DEVBOT_LOG` set, a valid JSONL file is written with one
+record per tool call; with it unset, nothing is written and behavior is
+unchanged. New tests cover the enabled and disabled paths (no network).
 
 ---
 
-## Phase 3 — Conversation persistence & resume
+## Phase 3 — readline UX on Windows
 
-Long sessions (and expensive megaswarm runs) are lost on exit.
+Every startup prints `[devbot] readline not available …`, which is noisy.
 
 **What to do:**
-- Persist the conversation (`messages`, model, mode, token totals) to
-  `.devbot/session-<id>.json` on each turn.
-- Add `--resume [id]` and a `/resume` command to reload the latest/selected
-  session.
-- Add `/sessions` to list saved sessions with timestamps and token counts.
-- Respect the sandbox: store under the project root; add `.devbot/` to
-  `.gitignore`.
+- In `devbot/cli.py`, only emit the readline warning ONCE per machine (e.g.
+  suppress it after first shown via a marker file under the user config dir), or
+  downgrade it to a single concise hint that also says
+  `pip install pyreadline3` to enable history.
+- Document the optional `pyreadline3` install in the README setup section
+  (it is already an optional `[win]` extra in `pyproject.toml`).
 
-**Done when:** quitting mid-task and `devbot --resume` restores the exact
-conversation and stats.
+**Done when:** a fresh interactive start shows at most a one-line hint (or none
+after first run), the REPL still works without readline, and a test verifies the
+warning logic (mock the readline-missing path). `pytest -q` green.
 
 ---
 
-## Phase 4 — Cost & context controls
+## Phase 4 — Session-wide token budget for autopilot/megaswarm
 
-Megaswarm runs have hit 1.5M tokens; users need visibility and brakes.
+`DEVBOT_TOKEN_BUDGET` is enforced per-Agent, but autopilot and megaswarm spawn
+fresh agents, so the budget resets and never caps the whole run.
 
 **What to do:**
-- Compression: use a cheaper model for summarization (configurable,
-  default `deepseek-v4-flash`) instead of the active model.
-- Add a per-session `DEVBOT_TOKEN_BUDGET` enforced for the *whole* session (not
-  just one megaswarm), with a clear stop + summary when hit.
-- Show a running cost estimate in `/stats` using the model's per-1M pricing.
-- Warn before a `megadelegate` that would launch more than N agents.
+- Add a process-wide cumulative token counter (module-level in `devbot/agent.py`,
+  incremented wherever `total_tokens` is updated) and a `DEVBOT_GLOBAL_BUDGET`
+  env var.
+- When the global budget is exceeded, new `Agent.run()` calls should stop early
+  with a clear message (same pattern as the existing per-session budget).
+- Have `devbot/autopilot.py` check the global budget between phases and stop
+  cleanly if exceeded, reporting how many phases completed.
 
-**Done when:** `/stats` shows estimated $ cost; the session budget halts work
-with a clear message; compression uses the cheap model.
+**Done when:** setting `DEVBOT_GLOBAL_BUDGET` halts work across multiple agents /
+phases; unset means unlimited. New tests cover the counter and the early-stop
+(mock the agents — no network).
 
 ---
 
-## Phase 5 — Polish & papercuts
+## Phase 5 — Documentation refresh
 
-- Windows readline: either bundle `pyreadline3` install guidance prominently or
-  implement a minimal history fallback so the startup warning isn't the first
-  thing users see.
-- `_resolve`/glob: `Path.match` doesn't support `**`; document or implement
-  recursive glob in `grep`/`find_files`.
-- Structured logging: optional `DEVBOT_LOG=path` to tee tool calls + errors to a
-  file (JSONL), separate from the pretty terminal output.
-- Remove the redundant megaswarm semaphore (the `ThreadPoolExecutor` already
-  caps concurrency) or document why it stays.
+The README predates swarm/megaswarm, pipeline, sessions, cost controls, and
+autopilot.
 
-**Done when:** each papercut is fixed or explicitly documented as a known
-limitation in the README.
+**What to do:**
+- Update `README.md` to document: all env vars (`DEVBOT_MODEL`,
+  `DEVBOT_MAX_TURNS`, `DEVBOT_MAX_PARALLEL`, `DEVBOT_TOKEN_BUDGET`,
+  `DEVBOT_GLOBAL_BUDGET`, `DEVBOT_COMPRESS_MODEL`, `DEVBOT_MEGA_WARN_THRESHOLD`,
+  `DEVBOT_SHOW_REASONING`, `DEVBOT_ALLOW_SHELL`, `DEVBOT_LOG`); the full tool
+  list; swarm vs megaswarm vs pipeline; `--run-plan` autopilot; and `--resume`.
+- Add a short "Safety model" section (sandboxed paths, shell allow/deny list,
+  approval gates, mandatory review pipeline).
+- Keep it accurate — verify each documented flag actually exists in the code.
+
+**Done when:** the README reflects the current feature set with no invented
+flags. (This phase changes docs/tests only; ensure `pytest -q` still passes.)
 
 ---
 
 ## Cross-cutting rules
-- Keep the approval-safety invariant: parallel sub-agents auto-approve dangerous
-  tools only with `-y`; otherwise they decline rather than block on stdin.
-- Every new feature ships with tests (post Phase 1) and a README update.
-- Verify with a cheap `deepseek-v4-flash` run before any `deepseek-v4-pro` run.
+- Every phase adds tests and leaves `pytest -q` green (CI runs them).
+- Use `pipeline` for all code changes; never bare write/edit as the manager.
+- No live API calls in tests — mock agents and use `tmp_path`.
+- Preserve the approval-safety invariant and the path sandbox.
