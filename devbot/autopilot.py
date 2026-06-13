@@ -19,7 +19,7 @@ HEADING_RE = re.compile(r"^##\s+(.*)$", re.MULTILINE)
 _PHASE_TITLE_RE = re.compile(r"Phase\s+\d+\b")
 
 # Imported lazily-overridable for testing.
-from .agent import Agent
+from .agent import Agent, check_global_budget_exceeded, get_global_token_count, _GLOBAL_BUDGET
 
 
 def parse_phases(plan_text: str) -> list[dict]:
@@ -81,6 +81,12 @@ def run_plan(root: Path, plan_path: str = "plan.md", model: str | None = None,
         return Agent(root=root, model=model, auto_approve=True, megaswarm=True)
 
     for idx, ph in enumerate(phases, 1):
+        if check_global_budget_exceeded():
+            print(f"\x1b[31m[autopilot] Global token budget exhausted "
+                  f"({get_global_token_count():,} >= {_GLOBAL_BUDGET:,}). "
+                  f"{idx-1}/{len(phases)} phases completed.\x1b[0m")
+            return False
+
         print(f"\n\x1b[36;1m{'='*70}\n[autopilot] PHASE {idx}/{len(phases)}: "
               f"{ph['title']}\n{'='*70}\x1b[0m")
 

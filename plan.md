@@ -1,119 +1,123 @@
 # DevBot improvement plan (autopilot-ready)
 
-Each `## Phase` below is independent and self-contained — run them with
-`devbot --run-plan plan.md`. After each phase the test suite must pass, so
-**every phase MUST add or update tests** under `tests/` and leave `pytest -q`
-green. Use the `pipeline` tool for all code changes. Do not start a phase other
-than the one assigned. Keep changes small and focused.
+Run with `devbot --run-plan plan.md`. Each `## Phase` is independent and
+self-contained. Every phase MUST add or update tests under `tests/` and leave
+`pytest -q` green (CI runs it). Use the `pipeline` tool for all code changes;
+never bare write/edit as the manager. No live API calls in tests — mock agents
+and use `tmp_path`/`monkeypatch`. Preserve the path sandbox and approval-safety
+invariant.
 
-These are genuinely pending items — the test suite, CI, shell sandbox, session
-persistence, cost controls, megaswarm pipeline/divide-and-conquer, the live
-dashboard, and reasoning suppression already exist; do not redo them.
-
----
-
-## Phase 1 — Recursive glob (`**`) in grep and find_files
-
-`grep` and `find_files` in `devbot/tools.py` match filenames with
-`Path(name).match(glob)`, which does NOT support `**` recursive patterns or
-path-segment globs like `src/**/*.py`. They already walk recursively, but the
-glob only ever sees the bare filename.
-
-**What to do:**
-- Make the `glob` argument support both bare-name patterns (`*.py`) and
-  path-relative recursive patterns (`**/*.py`, `devbot/*.py`).
-- Implement by matching the path **relative to the search base** with `fnmatch`
-  (translate `**` appropriately) or `pathlib.PurePath.full_match` if available;
-  fall back to filename matching when the pattern has no `/`.
-- Keep the existing `SKIP_DIRS` pruning and result caps unchanged.
-- Update the tool schema descriptions for `grep`/`find_files` to mention `**`.
-
-**Done when:** `find_files("**/*.py")` and `grep(pattern, glob="devbot/*.py")`
-match nested paths correctly, plain `*.py` still works, and new tests in
-`tests/` cover both bare and recursive patterns. `pytest -q` green.
+These are genuinely new items — testing/CI, shell sandbox, sessions, cost
+controls, megaswarm pipeline/divide, dashboard, reasoning suppression,
+recursive glob, JSONL logging, readline UX, and the global token budget already
+exist. Do not redo them.
 
 ---
 
-## Phase 2 — Optional structured logging (`DEVBOT_LOG`)
+## Phase 1 — .gitignore-aware search
 
-There is no machine-readable record of what DevBot did — only the pretty
-terminal output.
+`grep` and `find_files` in `devbot/tools.py` skip `SKIP_DIRS` but still return
+files the user has gitignored (build output, secrets, caches).
 
 **What to do:**
-- Add a small logging helper (e.g. `devbot/devlog.py`) that, when the env var
-  `DEVBOT_LOG` is set to a file path, appends one JSON object per line (JSONL)
-  for: each tool call (name, args summary, result length, ok/error) and each
-  assistant turn (model, prompt tokens, total tokens).
-- Wire it into the tool-dispatch path in `devbot/agent.py` behind the env var so
-  there is zero overhead and no behavior change when unset.
-- Never log secrets: redact any value that looks like an API key.
+- Add a helper that reads the project's `.gitignore` (root-level is enough) and
+  builds a matcher for its patterns (reuse `_glob_match` / `fnmatch`; support
+  `dir/`, `*.ext`, and bare names; ignore comments and blank lines).
+- In `grep` and `find_files`, skip any path whose relative form matches a
+  gitignore pattern, in addition to the existing `SKIP_DIRS` pruning.
+- Add an opt-out: a `respect_gitignore` argument (default True) on both tools,
+  surfaced in their schemas.
+- Keep it dependency-free and fast (parse `.gitignore` once per call).
 
-**Done when:** with `DEVBOT_LOG` set, a valid JSONL file is written with one
-record per tool call; with it unset, nothing is written and behavior is
-unchanged. New tests cover the enabled and disabled paths (no network).
+**Done when:** a gitignored file is excluded from `grep`/`find_files` by default
+and included when `respect_gitignore=False`; non-ignored files are unaffected.
+New tests cover both. `pytest -q` green.
 
 ---
 
-## Phase 3 — readline UX on Windows
+## Phase 2 — Stuck-loop detection
 
-Every startup prints `[devbot] readline not available …`, which is noisy.
+In long autonomous runs an agent can repeat the same failing tool call and burn
+tokens. `Agent.run()` in `devbot/agent.py` has no guard against this.
 
 **What to do:**
-- In `devbot/cli.py`, only emit the readline warning ONCE per machine (e.g.
-  suppress it after first shown via a marker file under the user config dir), or
-  downgrade it to a single concise hint that also says
-  `pip install pyreadline3` to enable history.
-- Document the optional `pyreadline3` install in the README setup section
-  (it is already an optional `[win]` extra in `pyproject.toml`).
+- Track a short history of recent tool calls (name + a hash of the JSON args).
+- If the SAME tool call (name+args) occurs `DEVBOT_LOOP_LIMIT` times in a row
+  (default 3), stop the loop with a clear message and return, instead of
+  continuing to `max_turns`.
+- Also stop if the same tool returns the identical error string that many times
+  in a row.
+- Make the limit configurable via the `DEVBOT_LOOP_LIMIT` env var (0 disables).
 
-**Done when:** a fresh interactive start shows at most a one-line hint (or none
-after first run), the REPL still works without readline, and a test verifies the
-warning logic (mock the readline-missing path). `pytest -q` green.
+**Done when:** a simulated repeated identical tool call halts after the limit
+with a clear message; normal varied tool use is unaffected. New tests drive the
+loop with a stubbed `_stream_once` (no network). `pytest -q` green.
 
 ---
 
-## Phase 4 — Session-wide token budget for autopilot/megaswarm
+## Phase 3 — REPL quality-of-life: tab completion, /tools, /cost
 
-`DEVBOT_TOKEN_BUDGET` is enforced per-Agent, but autopilot and megaswarm spawn
-fresh agents, so the budget resets and never caps the whole run.
+The interactive REPL has no completion and no quick way to see tools or cost.
 
 **What to do:**
-- Add a process-wide cumulative token counter (module-level in `devbot/agent.py`,
-  incremented wherever `total_tokens` is updated) and a `DEVBOT_GLOBAL_BUDGET`
-  env var.
-- When the global budget is exceeded, new `Agent.run()` calls should stop early
-  with a clear message (same pattern as the existing per-session budget).
-- Have `devbot/autopilot.py` check the global budget between phases and stop
-  cleanly if exceeded, reporting how many phases completed.
+- When readline is available, register a completer for slash-commands (`/help`,
+  `/clear`, `/stats`, `/model`, `/think`, `/swarm`, `/megaswarm`, `/resume`,
+  `/sessions`, `/exit`) so Tab completes them.
+- Add a `/tools` command that lists the agent's currently available tool names
+  (from `agent.tool_schemas`).
+- Add a `/cost` command that prints `agent.estimated_cost()` formatted as
+  `$X.XX` plus the session token total.
+- Update `COMMANDS_HELP` and the README REPL section.
 
-**Done when:** setting `DEVBOT_GLOBAL_BUDGET` halts work across multiple agents /
-phases; unset means unlimited. New tests cover the counter and the early-stop
-(mock the agents — no network).
+**Done when:** `/tools` and `/cost` work, the completer returns the right
+candidates for a given prefix, and tests cover the completer function and the
+two new command handlers (no network). `pytest -q` green.
 
 ---
 
-## Phase 5 — Documentation refresh
+## Phase 4 — Session export to Markdown
 
-The README predates swarm/megaswarm, pipeline, sessions, cost controls, and
-autopilot.
+Sessions persist as JSON but there's no human-readable export.
 
 **What to do:**
-- Update `README.md` to document: all env vars (`DEVBOT_MODEL`,
-  `DEVBOT_MAX_TURNS`, `DEVBOT_MAX_PARALLEL`, `DEVBOT_TOKEN_BUDGET`,
-  `DEVBOT_GLOBAL_BUDGET`, `DEVBOT_COMPRESS_MODEL`, `DEVBOT_MEGA_WARN_THRESHOLD`,
-  `DEVBOT_SHOW_REASONING`, `DEVBOT_ALLOW_SHELL`, `DEVBOT_LOG`); the full tool
-  list; swarm vs megaswarm vs pipeline; `--run-plan` autopilot; and `--resume`.
-- Add a short "Safety model" section (sandboxed paths, shell allow/deny list,
-  approval gates, mandatory review pipeline).
-- Keep it accurate — verify each documented flag actually exists in the code.
+- Add `export_markdown(agent, path)` in `devbot/session.py` that renders the
+  conversation as Markdown: a header (model, mode, tokens, est. cost), then each
+  user/assistant turn, with tool calls shown as fenced blocks and tool results
+  truncated to a sane length.
+- Add an `/export [path]` REPL command (default
+  `.devbot/session-<id>.md`) wired in `devbot/cli.py`.
+- Redact anything matching the API-key pattern in the output.
 
-**Done when:** the README reflects the current feature set with no invented
-flags. (This phase changes docs/tests only; ensure `pytest -q` still passes.)
+**Done when:** `/export` writes a valid Markdown file capturing the
+conversation; secrets are redacted. New tests build a fake agent and assert the
+file content (no network). `pytest -q` green.
+
+---
+
+## Phase 5 — Accurate cost via cache-hit accounting
+
+`estimated_cost()` uses a flat 50/50 input/output split and ignores DeepSeek's
+much-cheaper cache-hit input tokens, so estimates run high.
+
+**What to do:**
+- In `_stream_once`, capture the usage breakdown the API returns
+  (`prompt_tokens`, `completion_tokens`, and cache-hit/miss prompt tokens if
+  present — e.g. `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`).
+  Accumulate these on the agent.
+- Add cache-hit input rates to `MODEL_PRICING` and make `estimated_cost()` use
+  the real input/output/cache breakdown when available, falling back to the
+  current heuristic when it isn't.
+- Persist the new counters in `session.py` (defensively, with `getattr`).
+
+**Done when:** with a usage breakdown present, `estimated_cost()` reflects
+cache-hit pricing; with only totals, it falls back to the old behaviour. New
+tests cover both paths. `pytest -q` green.
 
 ---
 
 ## Cross-cutting rules
-- Every phase adds tests and leaves `pytest -q` green (CI runs them).
-- Use `pipeline` for all code changes; never bare write/edit as the manager.
-- No live API calls in tests — mock agents and use `tmp_path`.
-- Preserve the approval-safety invariant and the path sandbox.
+- Every phase adds tests and leaves `pytest -q` green.
+- Use `pipeline` for all code changes; mock agents in tests (no live API).
+- Document any new env var in the README config table (test_phase5 enforces
+  README↔code parity, so keep them in sync).
+- Preserve the path sandbox, the shell allow/deny model, and the approval rule.

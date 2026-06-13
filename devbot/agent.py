@@ -16,6 +16,7 @@ _CONFIRM_LOCK = threading.Lock()
 from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError, InternalServerError
 
 from .tools import TOOL_SCHEMAS, DANGEROUS_TOOLS, ALLOW_LIST, dispatch, check_command
+from .devlog import log_tool_call, log_turn
 
 # Transient errors worth retrying with backoff (vs. 4xx auth/balance errors).
 RETRYABLE = (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)
@@ -26,6 +27,29 @@ CONTEXT_LIMIT = 1_000_000
 # deepseek-chat / deepseek-reasoner are legacy aliases for V4-flash (non-thinking /
 # thinking); they are deprecated 2026-07-24 but still valid until then.
 KNOWN_MODELS = {"deepseek-v4-pro", "deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"}
+
+# ---------------------------------------------------------------------------
+# Session-wide (process-level) token budget — shared across all agents in
+# autopilot / megaswarm runs.
+# ---------------------------------------------------------------------------
+_GLOBAL_TOKEN_COUNT = 0
+_GLOBAL_BUDGET = int(os.environ.get("DEVBOT_GLOBAL_BUDGET", "0") or "0")
+
+
+def reset_global_token_count() -> None:
+    """Zero the global token counter (useful in tests)."""
+    global _GLOBAL_TOKEN_COUNT
+    _GLOBAL_TOKEN_COUNT = 0
+
+
+def get_global_token_count() -> int:
+    """Return the current global token count."""
+    return _GLOBAL_TOKEN_COUNT
+
+
+def check_global_budget_exceeded() -> bool:
+    """Return True iff the global budget is set (>0) and has been reached."""
+    return _GLOBAL_BUDGET > 0 and _GLOBAL_TOKEN_COUNT >= _GLOBAL_BUDGET
 
 
 def _load_dotenv(root: Path):
@@ -271,6 +295,15 @@ class Agent:
         agent is a delegated specialist)."""
         self.messages.append({"role": "user", "content": user_input})
 
+        if check_global_budget_exceeded():
+            self._safe_print(
+                f"[devbot] Global token budget exhausted "
+                f"({get_global_token_count():,} >= {_GLOBAL_BUDGET:,}). "
+                f"Process halted."
+            )
+            self._auto_save()
+            return ""
+
         if self.token_budget > 0 and self.total_tokens >= self.token_budget:
             self._safe_print(
                 f"[devbot] Token budget exhausted ({self.total_tokens:,} >= "
@@ -283,10 +316,17 @@ class Agent:
             text, tool_calls = self._stream_once()
 
             if self._budget_exhausted:
-                self._safe_print(
-                    f"[devbot] Token budget exhausted ({self.total_tokens:,} >= "
-                    f"{self.token_budget:,}). Session halted."
-                )
+                if check_global_budget_exceeded():
+                    self._safe_print(
+                        f"[devbot] Global token budget exhausted "
+                        f"({get_global_token_count():,} >= {_GLOBAL_BUDGET:,}). "
+                        f"Session halted."
+                    )
+                else:
+                    self._safe_print(
+                        f"[devbot] Token budget exhausted ({self.total_tokens:,} >= "
+                        f"{self.token_budget:,}). Session halted."
+                    )
                 self._auto_save()
                 return text or ""
 
@@ -355,6 +395,7 @@ class Agent:
                         self.on_tool_start(name, args)
                         result = dispatch(name, args, self.root)
 
+                    log_tool_call(name, args, result, ok=not result.startswith("Error"))
                     self.on_tool_end(result)
                     if not tc["id"]:
                         print(f"\x1b[33m[devbot] Warning: tool_call_id is empty for "
@@ -410,8 +451,13 @@ class Agent:
             if getattr(chunk, "usage", None):
                 self.last_prompt_tokens = chunk.usage.prompt_tokens
                 self.total_tokens += chunk.usage.total_tokens
+                global _GLOBAL_TOKEN_COUNT
+                _GLOBAL_TOKEN_COUNT += chunk.usage.total_tokens
                 if self.token_budget > 0 and self.total_tokens >= self.token_budget:
                     self._budget_exhausted = True
+                if check_global_budget_exceeded():
+                    self._budget_exhausted = True
+                log_turn(self.model, self.last_prompt_tokens, self.total_tokens)
                 # P1-1: context threshold check, now inside _stream_once right
                 # after the usage chunk so it fires at most once per API call.
                 if (self.last_prompt_tokens > 0.85 * CONTEXT_LIMIT
@@ -539,6 +585,8 @@ class Agent:
             summary = resp.choices[0].message.content
             if resp.usage:
                 self.total_tokens += resp.usage.total_tokens
+                global _GLOBAL_TOKEN_COUNT
+                _GLOBAL_TOKEN_COUNT += resp.usage.total_tokens
             if not summary:
                 self.messages = [self.messages[0]] + tail  # truncate, keep turn intact
                 return True

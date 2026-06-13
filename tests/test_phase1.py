@@ -8,6 +8,7 @@ import pytest
 
 from devbot.tools import (
     _resolve,
+    _glob_match,
     PathError,
     read_file,
     write_file,
@@ -482,3 +483,140 @@ class TestKeepIndex:
         # This would attempt compression (API call). We do NOT call it; we only
         # verify _keep_index returns 3.
         assert agent._keep_index() == 3
+
+
+# ============================================================================
+# 9. Recursive glob (**) support
+# ============================================================================
+
+class TestRecursiveGlob:
+    """Tests for _glob_match, find_files, and grep with ** patterns."""
+
+    # -- _glob_match unit tests -------------------------------------------------
+
+    def test_bare_pattern_no_slash(self):
+        """Bare pattern (no /) matches only the filename component."""
+        assert _glob_match("foo.txt", "*.txt") is True
+        assert _glob_match("subdir/foo.txt", "*.txt") is True
+        assert _glob_match("subdir/foo.py", "*.txt") is False
+        assert _glob_match("foo.txt", "foo.txt") is True
+        assert _glob_match("foo.py", "foo.txt") is False
+
+    def test_path_pattern_without_doublestar(self):
+        """A pattern with / but no ** matches exactly that path depth."""
+        assert _glob_match("devbot/foo.py", "devbot/*.py") is True
+        assert _glob_match("subdir/devbot/foo.py", "devbot/*.py") is False
+
+    def test_trailing_doublestar(self):
+        """** at end matches everything beyond."""
+        assert _glob_match("a/b/c/d.txt", "a/**") is True
+        assert _glob_match("a/b.txt", "a/**") is True
+
+    def test_mid_doublestar(self):
+        """** in the middle matches zero or more path segments."""
+        assert _glob_match("devbot/sub/foo.py", "devbot/**/*.py") is True
+        assert _glob_match("devbot/foo.py", "devbot/**/*.py") is True
+        assert _glob_match("other/foo.py", "devbot/**/*.py") is False
+
+    def test_leading_doublestar(self):
+        """** at the start matches any prefix."""
+        assert _glob_match("a/b/c/file.py", "**/*.py") is True
+        assert _glob_match("file.py", "**/*.py") is True
+        assert _glob_match("file.txt", "**/*.py") is False
+
+    def test_only_doublestar(self):
+        """** alone matches everything."""
+        assert _glob_match("anything.py", "**") is True
+        assert _glob_match("a/b/c/d.txt", "**") is True
+
+    def test_backslash_normalization(self):
+        """Backslashes in path or pattern are normalized."""
+        assert _glob_match("a\\b\\c.py", "a/b/*.py") is True
+        assert _glob_match("a/b/c.py", "a\\b\\*.py") is True
+        assert _glob_match("devbot\\tools.py", "devbot/*.py") is True
+
+    # -- find_files integration tests -------------------------------------------
+
+    def test_find_files_doublestar_finds_at_multiple_depths(self, tmp_path):
+        """find_files('**/*.py', root) finds .py files at any depth."""
+        (tmp_path / "top.py").write_text("")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "mid.py").write_text("")
+        (tmp_path / "sub" / "deep").mkdir()
+        (tmp_path / "sub" / "deep" / "bottom.py").write_text("")
+        (tmp_path / "sub" / "deep" / "data.txt").write_text("")
+        result = find_files("**/*.py", tmp_path)
+        assert "top.py" in result
+        assert "sub/mid.py" in result
+        assert "sub/deep/bottom.py" in result
+        assert "data.txt" not in result
+
+    def test_find_files_exact_dir(self, tmp_path):
+        """find_files('devbot/*.py', root) only matches directly in devbot/."""
+        (tmp_path / "devbot").mkdir()
+        (tmp_path / "devbot" / "tools.py").write_text("")
+        (tmp_path / "devbot" / "sub").mkdir()
+        (tmp_path / "devbot" / "sub" / "nested.py").write_text("")
+        result = find_files("devbot/*.py", tmp_path)
+        assert "devbot/tools.py" in result
+        assert "nested.py" not in result
+        assert "devbot/sub/nested.py" not in result
+
+    def test_find_files_bare_pattern_backward_compat(self, tmp_path):
+        """Bare '*.py' still works as before (backward compatibility)."""
+        (tmp_path / "top.py").write_text("")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "nested.py").write_text("")
+        (tmp_path / "other.txt").write_text("")
+        result = find_files("*.py", tmp_path)
+        assert "top.py" in result
+        assert "sub/nested.py" in result
+        assert "other.txt" not in result
+
+    def test_find_files_doublestar_middle(self, tmp_path):
+        """find_files('devbot/**/*.py', root) — ** in the middle."""
+        (tmp_path / "devbot").mkdir()
+        (tmp_path / "devbot" / "a.py").write_text("")
+        (tmp_path / "devbot" / "sub").mkdir()
+        (tmp_path / "devbot" / "sub" / "b.py").write_text("")
+        (tmp_path / "devbot" / "sub" / "deep").mkdir()
+        (tmp_path / "devbot" / "sub" / "deep" / "c.py").write_text("")
+        (tmp_path / "other").mkdir()
+        (tmp_path / "other" / "d.py").write_text("")
+        result = find_files("devbot/**/*.py", tmp_path)
+        assert "devbot/a.py" in result
+        assert "devbot/sub/b.py" in result
+        assert "devbot/sub/deep/c.py" in result
+        assert "other/d.py" not in result
+
+    # -- grep integration tests -------------------------------------------------
+
+    def test_grep_with_subdir_glob(self, tmp_path):
+        """grep with glob='subdir/*.txt' only matches directly in subdir/."""
+        (tmp_path / "root.txt").write_text("hello")
+        (tmp_path / "subdir").mkdir()
+        (tmp_path / "subdir" / "a.txt").write_text("hello world")
+        (tmp_path / "subdir" / "nested").mkdir()
+        (tmp_path / "subdir" / "nested" / "b.txt").write_text("hello")
+        result = grep("hello", tmp_path, glob="subdir/*.txt")
+        # Normalize Windows backslashes
+        result = result.replace("\\", "/")
+        assert "subdir/a.txt" in result
+        assert "nested" not in result
+        assert "root.txt" not in result
+
+    def test_grep_with_doublestar_glob(self, tmp_path):
+        """grep with glob='**/*.txt' matches at any depth."""
+        (tmp_path / "top.txt").write_text("hello")
+        (tmp_path / "a").mkdir()
+        (tmp_path / "a" / "mid.txt").write_text("hello")
+        (tmp_path / "a" / "b").mkdir()
+        (tmp_path / "a" / "b" / "deep.txt").write_text("hello")
+        (tmp_path / "a" / "b" / "other.py").write_text("hello")
+        result = grep("hello", tmp_path, glob="**/*.txt")
+        # Normalize Windows backslashes
+        result = result.replace("\\", "/")
+        assert "top.txt" in result
+        assert "a/mid.txt" in result
+        assert "a/b/deep.txt" in result
+        assert "other.py" not in result

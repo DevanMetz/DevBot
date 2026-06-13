@@ -7,24 +7,35 @@ from pathlib import Path
 # Enable arrow-key history/editing in the REPL when available. The stdlib
 # `readline` ships on Linux/macOS; on Windows it comes from `pyreadline3`.
 # Either way it auto-hooks input() on import, so we just try and move on.
-try:
-    import atexit
-    import readline
+def _setup_readline(history_path=None, marker_path=None):
+    if history_path is None:
+        history_path = Path.home() / ".devbot_history"
+    if marker_path is None:
+        marker_path = Path.home() / ".devbot_readline_warned"
+    try:
+        import atexit
+        import readline
 
-    _HISTORY = Path.home() / ".devbot_history"
-    try:
-        readline.read_history_file(_HISTORY)
-    except (FileNotFoundError, OSError):
-        pass
-    readline.set_history_length(1000)
-    try:
-        atexit.register(lambda: readline.write_history_file(_HISTORY))
-    except Exception:
-        pass
-except ImportError:
-    import sys as _sys
-    print("[devbot] readline not available — arrow-key history and line editing disabled.",
-          file=_sys.stderr)
+        try:
+            readline.read_history_file(history_path)
+        except (FileNotFoundError, OSError):
+            pass
+        readline.set_history_length(1000)
+        try:
+            atexit.register(lambda: readline.write_history_file(history_path))
+        except Exception:
+            pass
+    except ImportError:
+        if marker_path.exists():
+            return
+        print("[devbot] readline not available — pip install pyreadline3 to enable arrow-key history",
+              file=sys.stderr)
+        try:
+            marker_path.write_text("")
+        except OSError:
+            pass
+
+_setup_readline()
 
 from openai import AuthenticationError, PermissionDeniedError
 

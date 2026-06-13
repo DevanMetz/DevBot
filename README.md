@@ -9,7 +9,13 @@ task is done.
 ## Features
 
 - **Streaming agentic loop** with OpenAI-compatible function calling against DeepSeek.
-- **Nine built-in tools** for reading, searching, editing, running, web-searching, and testing code.
+- **Twelve built-in tools** for reading, searching, editing, running, web-searching, and testing code.
+- **Pipeline mode** — mandatory review→fix loop so every code change is audited before it ships.
+- **Session persistence** — sessions auto-save after each turn; resume later with `--resume` or `/resume`.
+- **Autopilot** — `--run-plan` reads `plan.md` and implements each `## Phase` step-by-step, unattended.
+- **Cost estimation** — live USD cost estimate based on per-model pricing.
+- **Structured JSONL logging** — set `DEVBOT_LOG` to a file path for timestamped tool-call and turn logs.
+- **Global token budget** — process-wide cap (`DEVBOT_GLOBAL_BUDGET`) shared across all swarm agents.
 - **Approval gates** — writes, shell commands, and test runs require confirmation (`y` / `a`lways / decline).
 - **Sandboxed file access** — tools cannot read or write outside the project root.
 - **Swarm mode** — a manager agent can delegate subtasks to specialist sub-agents.
@@ -25,13 +31,16 @@ task is done.
 |---|---|---|
 | `read_file` | Read a file with line numbers | no |
 | `list_dir` | List a directory | no |
-| `grep` | Regex search across the project | no |
-| `find_files` | Find files by name glob (e.g. `*.py`) | no |
+| `grep` | Regex search across the project (supports `**` recursive patterns) | no |
+| `find_files` | Find files by name glob (e.g. `*.py`, supports `**` recursive patterns) | no |
 | `web_search` | Web search via DuckDuckGo (titles, URLs, snippets) | no |
 | `write_file` | Create/overwrite a file | yes |
 | `edit_file` | Exact string replacement in a file | yes |
 | `run_command` | Shell command in the project root | yes |
 | `verify` | Auto-detect & run the project's test suite | yes |
+| `delegate` | Delegate a subtask to a specialist sub-agent (swarm only) | no |
+| `pipeline` | Implement a task with automatic review→fix loop (swarm only) | no |
+| `megadelegate` | Launch N specialists in parallel + reviewer synthesis (megaswarm only) | no |
 
 ## Setup
 
@@ -40,6 +49,12 @@ pip install -e .
 ```
 
 This installs the `openai` SDK and `ddgs` (DuckDuckGo search, used by `web_search`).
+
+On Windows, optionally install `pyreadline3` for arrow-key history and line editing:
+```sh
+pip install -e .[win]
+```
+(Or `pip install pyreadline3`.)
 
 Get an API key at https://platform.deepseek.com, then:
 
@@ -56,6 +71,12 @@ devbot "fix the failing test"  # one-shot mode
 devbot -y                    # auto-approve all tool calls (be careful)
 devbot -m deepseek-v4-pro    # use the more capable model for harder tasks
 devbot -C path/to/project    # operate on another directory
+devbot -s                    # swarm mode
+devbot -M                    # megaswarm mode (3 parallel agents + reviewer)
+devbot --run-plan            # autopilot: implement each `## Phase` from plan.md
+devbot --run-plan my-plan.md # use a custom plan file
+devbot --resume              # resume the latest saved session
+devbot --resume <session-id> # resume a specific session
 ```
 
 In the REPL:
@@ -65,7 +86,11 @@ In the REPL:
 - `/stats` — show token usage (last prompt + session total) and message count
 - `/model <name>` — switch model (`deepseek-v4-flash` or `deepseek-v4-pro`; warns on unknown names)
 - `/auto` — toggle auto-approve
+- `/think` — toggle display of chain-of-thought reasoning
 - `/swarm` — toggle swarm mode (resets the conversation)
+- `/megaswarm` — toggle megaswarm mode (3 parallel agents + reviewer; resets conversation)
+- `/resume [id]` — reload a saved session (latest if no id given)
+- `/sessions` — list saved sessions with timestamps and token counts
 - `/exit` — quit
 
 DevBot tracks token usage per call and warns (and auto-compresses) when a prompt
@@ -100,7 +125,22 @@ Sub-agents never get the `delegate` tool themselves (no recursion) and still
 respect approval gates. Specialist definitions live in
 [`devbot/swarm.py`](devbot/swarm.py).
 
-### Megaswarm mode
+### Pipeline mode
+
+`pipeline(task)` is the sanctioned way to make code changes in swarm mode.
+It runs a coder → reviewer → coder-fix loop:
+
+1. A `coder` implements the task.
+2. A `reviewer` inspects the actual files for real bugs and responds with
+   `VERDICT: CLEAN` or `VERDICT: ISSUES` (with a numbered list of concrete fixes).
+3. If issues are found, the coder fixes them and the cycle repeats (up to the
+   round limit set by `DEVBOT_PIPELINE_ROUNDS`, default 2).
+
+The manager **must** use `pipeline` for any task that creates, edits, or deletes
+files. Direct use of `write_file`, `edit_file`, or mutating `run_command` by the
+manager is prohibited — this is enforced by a **HARD RULE** in the system prompt.
+
+## Megaswarm mode
 
 Run with `--megaswarm` (or `-M`, or toggle with `/megaswarm`) for a heavier
 pattern. The manager additionally gets a `megadelegate(task)` tool that:
@@ -119,11 +159,35 @@ synthesis streams normally. Approval prompts are serialized across threads.
 > **Tip:** run megaswarm with `-y` (auto-approve). With approval on, the parallel
 > `coder` will block waiting for confirmation, which is awkward mid-parallel-run.
 
+### Divide-and-conquer mode
+
+`megadelegate(task, subtasks=[...])` enables a divide-and-conquer pattern:
+you pass a list of independent subtasks, each gets its own coder, and a reviewer
+integrates the results.
+
+- Each subtask runs concurrently — use for genuinely independent units touching
+  **different files**.
+- Do **not** put interdependent edits to the same file in separate subtasks
+  (they will conflict).
+- After a divide-and-conquer `megadelegate`, run a `pipeline` pass over anything
+  correctness-critical for an extra safety net.
+
 ## Configuration
 
-- `DEEPSEEK_API_KEY` (required)
-- `DEVBOT_MODEL` — default model, overridden by `-m`
-- `DEVBOT_MAX_TURNS` — max tool iterations per message (default 40)
+| Variable | Purpose | Default |
+|---|---|---|
+| `DEEPSEEK_API_KEY` | API key (required) | — |
+| `DEVBOT_MODEL` | Model id | `deepseek-v4-flash` |
+| `DEVBOT_MAX_TURNS` | Max tool iterations per message | 200 |
+| `DEVBOT_MAX_PARALLEL` | Max parallel agents in megaswarm | 8 |
+| `DEVBOT_TOKEN_BUDGET` | Per-agent token cap (0 = unlimited) | 0 |
+| `DEVBOT_GLOBAL_BUDGET` | Process-wide token cap (0 = unlimited) | 0 |
+| `DEVBOT_COMPRESS_MODEL` | Model used for context compression | `deepseek-v4-flash` |
+| `DEVBOT_MEGA_WARN_THRESHOLD` | Warn when N > threshold in megadelegate | 5 |
+| `DEVBOT_PIPELINE_ROUNDS` | Max review→fix rounds in pipeline | 2 |
+| `DEVBOT_SHOW_REASONING` | Show chain-of-thought (`1`, `true`, `yes`) | off |
+| `DEVBOT_ALLOW_SHELL` | Skip shell approval for allow-listed commands (`1`, `true`) | off |
+| `DEVBOT_LOG` | Path for JSONL structured log | off (no logging) |
 
 You can also put these in a `.env` file in your project root instead of exporting them:
 
@@ -133,5 +197,15 @@ DEVBOT_MODEL=deepseek-v4-flash
 ```
 
 Real environment variables take precedence over `.env`. Add `.env` to your `.gitignore`.
+
+## Safety model
+
+DevBot is designed to be safe by default:
+
+- **Sandboxed paths** — tools cannot read or write outside the project root. All paths are resolved and checked; `..` escapes and symlink tricks are rejected.
+- **Shell block-list** — dangerous patterns (`rm -rf /`, `sudo`, `curl|sh`, fork bombs, etc.) are blocked outright. The model is told the command was rejected so it can adjust.
+- **Shell allow-list** — safe/read-only commands (git status, pytest, ls, echo, cargo test, go vet, etc.) can be auto-approved with `DEVBOT_ALLOW_SHELL`.
+- **Approval gates** — by default, writes, shell commands, and test runs require interactive confirmation (`y` / `a`lways / decline). The model sees the rejection so it can recover.
+- **Mandatory review pipeline** — any code change (write_file, edit_file, or mutating run_command) MUST go through `pipeline(task)`, which enforces a coder→reviewer→fix loop. Direct writes by the manager are prohibited by system prompt.
 
 In thinking mode the model's chain-of-thought is streamed (dimmed) before its answer.

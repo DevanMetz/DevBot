@@ -1,5 +1,6 @@
 """Tool implementations and JSON schemas exposed to the model."""
 
+import fnmatch
 import locale
 import os
 import py_compile
@@ -65,6 +66,59 @@ ALLOW_LIST = [
 # Shell operators that allow chaining, redirection, or substitution. An
 # allow-listed prefix containing any of these can't be trusted under shell=True.
 _SHELL_META = re.compile(r"[;&|`><\n]|\$\(")
+
+
+def _glob_match(path_str: str, pattern: str) -> bool:
+    """Match a relative path (forward-slash) against a glob pattern.
+
+    If *pattern* contains no ``/``, matching is done against the bare
+    filename only (the last component of *path_str*).  This preserves
+    backward compatibility with ``Path(name).match(glob)``.
+
+    If *pattern* contains ``/``, the path and pattern are split on ``/``
+    and matched segment-by-segment, with ``**`` matching zero or more
+    path segments.
+    """
+    # Normalize backslashes → forward slashes so Windows paths work.
+    path_str = path_str.replace("\\", "/")
+    pattern = pattern.replace("\\", "/")
+
+    if "/" not in pattern:
+        # Bare filename pattern — match against the last component only.
+        basename = path_str.rsplit("/", 1)[-1]
+        return fnmatch.fnmatch(basename, pattern)
+
+    path_parts = path_str.split("/")
+    pat_parts = pattern.split("/")
+
+    def _match_segments(pi: int, pj: int) -> bool:
+        """Match pat_parts[pi:] against path_parts[pj:]."""
+        while pi < len(pat_parts) and pj < len(path_parts):
+            if pat_parts[pi] == "**":
+                if pi == len(pat_parts) - 1:
+                    # Trailing ** matches everything (including empty).
+                    return True
+                # Mid-path **: try matching zero or more path segments.
+                for skip in range(len(path_parts) - pj + 1):
+                    if _match_segments(pi + 1, pj + skip):
+                        return True
+                return False
+            else:
+                if not fnmatch.fnmatch(path_parts[pj], pat_parts[pi]):
+                    return False
+                pi += 1
+                pj += 1
+
+        # Consumed all pattern parts — need all path parts consumed too.
+        if pi == len(pat_parts):
+            return pj == len(path_parts)
+        # Consumed all path parts — remaining pattern must be only **.
+        if pj == len(path_parts):
+            return pi == len(pat_parts) - 1 and pat_parts[pi] == "**"
+
+        return False
+
+    return _match_segments(0, 0)
 
 
 class PathError(Exception):
@@ -195,13 +249,15 @@ def grep(pattern: str, root: Path, path: str = ".", glob: str = "") -> str:
     for dirpath, dirnames, filenames in os.walk(base):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for name in filenames:
-            if glob and not Path(name).match(glob):
-                continue
+            if glob:
+                rel = str((Path(dirpath) / name).relative_to(base)).replace("\\", "/")
+                if not _glob_match(rel, glob):
+                    continue
             fp = Path(dirpath) / name
             try:
                 for n, line in enumerate(fp.read_text(encoding="utf-8").splitlines(), 1):
                     if rx.search(line):
-                        hits.append(f"{fp.relative_to(base)}:{n}: {line.strip()}")
+                        hits.append(f"{str(fp.relative_to(base)).replace('\\', '/')}:{n}: {line.strip()}")
                         if len(hits) >= 200:
                             return _clip("\n".join(hits) + "\n... [stopped at 200 matches]")
             except (UnicodeDecodeError, PermissionError, OSError):
@@ -215,8 +271,9 @@ def find_files(glob: str, root: Path, path: str = ".") -> str:
     for dirpath, dirnames, filenames in os.walk(base):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for name in filenames:
-            if Path(name).match(glob):
-                matches.append(str((Path(dirpath) / name).relative_to(base)))
+            rel = str((Path(dirpath) / name).relative_to(base)).replace("\\", "/")
+            if _glob_match(rel, glob):
+                matches.append(rel)
                 if len(matches) >= 500:
                     return _clip("\n".join(matches) + "\n... [stopped at 500 files]")
     return _clip("\n".join(sorted(matches)) or "No files matched")
@@ -478,7 +535,7 @@ TOOL_SCHEMAS = [
                 "properties": {
                     "pattern": {"type": "string"},
                     "path": {"type": "string", "description": "Directory to search, default project root"},
-                    "glob": {"type": "string", "description": "Filename glob filter, e.g. *.py"},
+                    "glob": {"type": "string", "description": "Filename glob filter, e.g. *.py or src/**/*.py. Supports ** for recursive matching."},
                 },
                 "required": ["pattern"],
             },
@@ -488,11 +545,11 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "find_files",
-            "description": "Find files by name using a glob pattern, e.g. *.py or test_*.txt. Searches recursively.",
+            "description": "Find files by name using a glob pattern, e.g. *.py or test_*.txt. Searches recursively. Supports ** patterns.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "glob": {"type": "string", "description": "Filename glob, e.g. *.py"},
+                    "glob": {"type": "string", "description": "Filename glob, e.g. *.py or **/*.py. Supports ** for recursive matching."},
                     "path": {"type": "string", "description": "Directory to search, default project root"},
                 },
                 "required": ["glob"],

@@ -313,3 +313,158 @@ class TestMegaWarnThreshold:
         assert (6 > threshold) is True
         # n=20 should trigger
         assert (20 > threshold) is True
+
+
+# ============================================================================
+# 6. Global token budget — session-wide process-level budget
+# ============================================================================
+
+class TestGlobalTokenBudget:
+    """Tests for session-wide global token budget (_GLOBAL_TOKEN_COUNT /
+    _GLOBAL_BUDGET / check_global_budget_exceeded etc.)."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_api_key(self, monkeypatch):
+        """Set a dummy API key so Agent.__init__ doesn't call SystemExit."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dummy-key")
+
+    @pytest.fixture(autouse=True)
+    def _reset_global_counter(self):
+        """Ensure the global token counter is zero before each test."""
+        from devbot import agent
+        agent.reset_global_token_count()
+
+    # ------------------------------------------------------------------
+    # Basic module-level variable & helper tests
+    # ------------------------------------------------------------------
+
+    def test_global_counter_increments(self, monkeypatch):
+        """reset_global_token_count and get_global_token_count work;
+        _GLOBAL_TOKEN_COUNT and _GLOBAL_BUDGET are present in the module."""
+        from devbot import agent
+
+        # Initial state after fixture reset
+        assert agent.get_global_token_count() == 0
+
+        # Manually increment the counter (simulating what _stream_once does)
+        agent._GLOBAL_TOKEN_COUNT += 500
+        assert agent.get_global_token_count() == 500
+
+        # reset works
+        agent.reset_global_token_count()
+        assert agent.get_global_token_count() == 0
+
+        # _GLOBAL_BUDGET is present
+        assert hasattr(agent, "_GLOBAL_BUDGET")
+
+    def test_check_global_budget_exceeded_when_exceeded(self):
+        """check_global_budget_exceeded → True when counter >= budget > 0."""
+        from devbot import agent
+
+        agent._GLOBAL_BUDGET = 1000
+        agent._GLOBAL_TOKEN_COUNT = 1000
+        assert agent.check_global_budget_exceeded() is True
+
+        agent._GLOBAL_TOKEN_COUNT = 2000
+        assert agent.check_global_budget_exceeded() is True
+
+    def test_check_global_budget_exceeded_when_not_exceeded(self):
+        """check_global_budget_exceeded → False when counter < budget."""
+        from devbot import agent
+
+        agent._GLOBAL_BUDGET = 1000
+        agent._GLOBAL_TOKEN_COUNT = 500
+        assert agent.check_global_budget_exceeded() is False
+
+        agent._GLOBAL_TOKEN_COUNT = 0
+        assert agent.check_global_budget_exceeded() is False
+
+    def test_check_global_budget_zero_budget_unlimited(self):
+        """_GLOBAL_BUDGET = 0 → check_global_budget_exceeded() always False."""
+        from devbot import agent
+
+        agent._GLOBAL_BUDGET = 0
+        agent._GLOBAL_TOKEN_COUNT = 1_000_000
+        assert agent.check_global_budget_exceeded() is False
+
+        agent._GLOBAL_TOKEN_COUNT = 10_000_000
+        assert agent.check_global_budget_exceeded() is False
+
+    def test_global_budget_unset_is_unlimited(self, monkeypatch):
+        """Without DEVBOT_GLOBAL_BUDGET, _GLOBAL_BUDGET is 0,
+        and check_global_budget_exceeded() is False even with a large count."""
+        monkeypatch.delenv("DEVBOT_GLOBAL_BUDGET", raising=False)
+        from devbot import agent
+
+        # Reload-style: re-evaluate the env
+        agent._GLOBAL_BUDGET = int(
+            os.environ.get("DEVBOT_GLOBAL_BUDGET", "0") or "0"
+        )
+        assert agent._GLOBAL_BUDGET == 0
+        agent._GLOBAL_TOKEN_COUNT = 5_000_000
+        assert agent.check_global_budget_exceeded() is False
+
+    # ------------------------------------------------------------------
+    # Agent.run() stops on global budget
+    # ------------------------------------------------------------------
+
+    def test_agent_run_stops_on_global_budget(self, tmp_path, monkeypatch):
+        """When _GLOBAL_TOKEN_COUNT >= _GLOBAL_BUDGET (>0), agent.run('test')
+        returns '' without making API calls. Only the user message is appended."""
+        from devbot import agent
+
+        agent._GLOBAL_BUDGET = 500
+        agent._GLOBAL_TOKEN_COUNT = 500
+
+        ag = Agent(root=tmp_path, auto_approve=True)
+        msg_count_before = len(ag.messages)
+
+        result = ag.run("do something")
+
+        assert result == ""
+        # Only the user message was appended — no API call
+        assert len(ag.messages) == msg_count_before + 1
+        assert ag.messages[-1]["role"] == "user"
+        assert ag.messages[-1]["content"] == "do something"
+
+    # ------------------------------------------------------------------
+    # Autopilot stops between phases
+    # ------------------------------------------------------------------
+
+    def test_autopilot_stops_between_phases(self, tmp_path, monkeypatch):
+        """Mock check_global_budget_exceeded → returns False then True;
+        verify run_plan stops after first phase and reports correct count."""
+        from devbot.autopilot import run_plan
+
+        # Write a plan with two phases
+        plan_text = (
+            "## Phase 1 – First\n"
+            "Do the first thing.\n\n"
+            "## Phase 2 – Second\n"
+            "Do the second thing.\n"
+        )
+        plan_path = tmp_path / "plan.md"
+        plan_path.write_text(plan_text, encoding="utf-8")
+
+        # A counter to control mock return values
+        call_count = [0]
+
+        def mock_check():
+            call_count[0] += 1
+            # First call (phase 1): not exceeded
+            # Second call (phase 2): exceeded → stop
+            return call_count[0] >= 2
+
+        # Monkey-patch check_global_budget_exceeded in autopilot
+        import devbot.autopilot as ap
+        monkeypatch.setattr(ap, "check_global_budget_exceeded", mock_check)
+        monkeypatch.setattr(ap, "get_global_token_count", lambda: 1000)
+        monkeypatch.setattr(ap, "_GLOBAL_BUDGET", 1000)
+        # Mock Agent.run to avoid API calls and _run_tests to always pass
+        monkeypatch.setattr(ap.Agent, "run", lambda self, prompt: "ok")
+        monkeypatch.setattr(ap, "_run_tests", lambda root: (True, ""))
+
+        result = run_plan(tmp_path, plan_path="plan.md")
+        assert result is False
+        # Phase 1 ran (call 1 returned False), phase 2 check returned True
+        assert call_count[0] == 2

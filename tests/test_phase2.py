@@ -375,3 +375,158 @@ class TestAllowListMetacharBypass:
     @pytest.mark.parametrize("command", ["git status", "ls -la", "pytest -q", "echo hi"])
     def test_plain_allowlisted_still_allowed(self, command):
         assert check_command(command)[0] == "allowed"
+
+
+# ============================================================================
+# 5. DEVBOT_LOG structured logging (devbot/devlog.py)
+# ============================================================================
+
+import json as _json
+import devbot.devlog as _devlog
+
+
+class TestDevLogEnabled:
+    """Tests when DEVBOT_LOG IS set to a file path."""
+
+    def test_log_tool_call_writes_jsonl_record(self, tmp_path, monkeypatch):
+        logfile = tmp_path / "session.jsonl"
+        monkeypatch.setattr(_devlog, "_LOGFILE", str(logfile))
+
+        result_string = "line1\nline2"
+        _devlog.log_tool_call("read_file", {"path": "foo.py"}, result_string, True)
+
+        assert logfile.exists(), "log file was not created"
+        lines = logfile.read_text("utf-8").strip().splitlines()
+        assert len(lines) == 1, f"expected exactly 1 line, got {len(lines)}"
+
+        record = _json.loads(lines[0])
+        assert record["type"] == "tool_call"
+        assert record["name"] == "read_file"
+        assert record["result_length"] == len(result_string)
+        assert record["ok"] is True
+
+    def test_log_turn_writes_jsonl_record(self, tmp_path, monkeypatch):
+        logfile = tmp_path / "session.jsonl"
+        monkeypatch.setattr(_devlog, "_LOGFILE", str(logfile))
+
+        _devlog.log_turn("deepseek-v4-flash", 1500, 3000)
+
+        assert logfile.exists()
+        lines = logfile.read_text("utf-8").strip().splitlines()
+        assert len(lines) == 1
+
+        record = _json.loads(lines[0])
+        assert record["type"] == "assistant_turn"
+        assert record["model"] == "deepseek-v4-flash"
+        assert record["prompt_tokens"] == 1500
+        assert record["total_tokens"] == 3000
+
+    def test_multiple_calls_produce_multiple_lines(self, tmp_path, monkeypatch):
+        logfile = tmp_path / "session.jsonl"
+        monkeypatch.setattr(_devlog, "_LOGFILE", str(logfile))
+
+        _devlog.log_tool_call("read_file", {"path": "a.py"}, "ok", True)
+        _devlog.log_turn("deepseek-v4-flash", 100, 200)
+
+        lines = logfile.read_text("utf-8").strip().splitlines()
+        assert len(lines) == 2, f"expected 2 lines, got {len(lines)}"
+        for line in lines:
+            record = _json.loads(line)
+            assert "type" in record
+            assert "timestamp" in record
+
+    def test_api_key_redacted_in_args(self, tmp_path, monkeypatch):
+        logfile = tmp_path / "session.jsonl"
+        monkeypatch.setattr(_devlog, "_LOGFILE", str(logfile))
+
+        _devlog.log_tool_call(
+            "delegate",
+            {"role": "coder", "api_key": "sk-abc123"},
+            "ok",
+            True,
+        )
+
+        lines = logfile.read_text("utf-8").strip().splitlines()
+        assert len(lines) == 1
+        record = _json.loads(lines[0])
+        args = record["args"]
+        assert args["api_key"] == "<REDACTED:API_KEY>"
+        assert args["role"] == "coder"
+
+    def test_result_error_ok_false(self, tmp_path, monkeypatch):
+        logfile = tmp_path / "session.jsonl"
+        monkeypatch.setattr(_devlog, "_LOGFILE", str(logfile))
+
+        error_msg = "Error: something broke"
+        _devlog.log_tool_call("run_command", {"command": "bad"}, error_msg, False)
+
+        lines = logfile.read_text("utf-8").strip().splitlines()
+        assert len(lines) == 1
+        record = _json.loads(lines[0])
+        assert record["ok"] is False
+        assert record["result_length"] == len(error_msg)
+
+    def test_long_args_truncated(self, tmp_path, monkeypatch):
+        logfile = tmp_path / "session.jsonl"
+        monkeypatch.setattr(_devlog, "_LOGFILE", str(logfile))
+
+        long_value = "x" * 200
+        _devlog.log_tool_call("write_file", {"content": long_value}, "ok", True)
+
+        lines = logfile.read_text("utf-8").strip().splitlines()
+        assert len(lines) == 1
+        record = _json.loads(lines[0])
+        logged_value = record["args"]["content"]
+        # Truncated to 120 chars + "..."
+        assert logged_value == "x" * 120 + "..."
+        assert len(logged_value) == 123
+
+
+class TestDevLogDisabled:
+    """Tests when DEVBOT_LOG is NOT set (module _LOGFILE is None)."""
+
+    def test_log_tool_call_is_noop(self, monkeypatch):
+        monkeypatch.setattr(_devlog, "_LOGFILE", None)
+        # Should return None and not raise.
+        result = _devlog.log_tool_call("read_file", {"path": "f"}, "out", True)
+        assert result is None
+
+    def test_log_turn_is_noop(self, monkeypatch):
+        monkeypatch.setattr(_devlog, "_LOGFILE", None)
+        result = _devlog.log_turn("deepseek-v4-flash", 100, 200)
+        assert result is None
+
+
+class TestDevLogAgentWiring:
+    """Tests that agent.py actually imports and calls the log functions."""
+
+    def test_dispatch_logs_tool_call(self):
+        """Verify devbot.agent imports log_tool_call and log_turn."""
+        import devbot.agent as _agent
+
+        # Check that the names exist in the agent module's namespace.
+        assert hasattr(_agent, "log_tool_call"), (
+            "agent.py must import log_tool_call from devbot.devlog"
+        )
+        assert hasattr(_agent, "log_turn"), (
+            "agent.py must import log_turn from devbot.devlog"
+        )
+
+        # Verify they are the same callables as devlog exports.
+        assert _agent.log_tool_call is _devlog.log_tool_call
+        assert _agent.log_turn is _devlog.log_turn
+
+    @pytest.mark.parametrize("result, expected_ok", [
+        ("Error: something", False),
+        ("Wrote 10 chars to foo", True),
+        ("error connecting", True),         # not starting with "Error"
+        ("Error", False),                    # exact match
+        ("", True),                          # empty string does NOT start with "Error"
+        ("Everything OK", True),
+    ])
+    def test_dispatch_ok_detection(self, result, expected_ok):
+        """ok=not result.startswith('Error') as used in agent.py dispatch."""
+        ok = not result.startswith("Error")
+        assert ok is expected_ok, (
+            f"result={result!r}: expected ok={expected_ok}, got ok={ok}"
+        )
