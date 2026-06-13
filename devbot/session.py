@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,11 @@ if TYPE_CHECKING:
 
 SESSIONS_DIR = ".devbot"
 SESSION_PREFIX = "session-"
+
+# Pattern for API keys to redact in exports.  The devlog module also defines
+# ^sk-[a-zA-Z0-9]+$ (anchored) for whole-value matching in structured data; we
+# use a non-anchored version here so keys embedded in message text are caught.
+_API_KEY_RX = re.compile(r"\bsk-[a-zA-Z0-9]+\b")
 
 
 def _sessions_dir(root: Path) -> Path:
@@ -69,6 +75,9 @@ def save_session(agent: "Agent") -> str | None:
         "megaswarm": agent.megaswarm,
         "auto_approve": agent.auto_approve,
         "total_tokens": getattr(agent, "total_tokens", 0),
+        "completion_tokens": getattr(agent, "completion_tokens", 0),
+        "prompt_cache_hit_tokens": getattr(agent, "prompt_cache_hit_tokens", 0),
+        "prompt_cache_miss_tokens": getattr(agent, "prompt_cache_miss_tokens", 0),
         "last_prompt_tokens": getattr(agent, "last_prompt_tokens", 0),
         "delegation_count": getattr(agent, "delegation_count", 0),
         "token_budget": getattr(agent, "token_budget", 0),
@@ -170,9 +179,184 @@ def restore_agent(root: Path, session_id: str | None = None,
     )
     agent.messages = data.get("messages", agent.messages)
     agent.total_tokens = data.get("total_tokens", 0)
+    agent.completion_tokens = data.get("completion_tokens", 0)
+    agent.prompt_cache_hit_tokens = data.get("prompt_cache_hit_tokens", 0)
+    agent.prompt_cache_miss_tokens = data.get("prompt_cache_miss_tokens", 0)
     agent.last_prompt_tokens = data.get("last_prompt_tokens", 0)
     agent.delegation_count = data.get("delegation_count", 0)
     agent.token_budget = data.get("token_budget", 0)
     agent.session_id = data.get("id", session_id)
     agent.session_created = data.get("created", "")
     return agent
+
+
+# ---------------------------------------------------------------------------
+# Markdown export
+# ---------------------------------------------------------------------------
+
+def _redact_md(val: str) -> str:
+    """Redact any API-key-looking substrings in *val*."""
+    return _API_KEY_RX.sub("<REDACTED:API_KEY>", val)
+
+
+def _truncate_result(text: str, max_chars: int = 500, max_lines: int = 10) -> str:
+    """Return *text* truncated to *max_chars* chars and *max_lines* lines.
+
+    If truncation is applied, ``... (truncated)`` is appended.
+    """
+    lines = text.splitlines()
+    line_truncated = len(lines) > max_lines
+    if line_truncated:
+        lines = lines[:max_lines]
+        text = "\n".join(lines)
+
+    char_truncated = len(text) > max_chars
+    if char_truncated:
+        text = text[:max_chars]
+
+    if line_truncated or char_truncated:
+        text = text.rstrip("\n") + "\n... (truncated)"
+    return text
+
+
+def export_markdown(agent: "Agent", path: Path | str | None = None) -> Path:
+    """Export the agent's conversation to a Markdown file.
+
+    Parameters
+    ----------
+    agent:
+        The agent whose messages to export.
+    path:
+        Output file path.  Defaults to ``agent.root / ".devbot" /
+        f"{agent.session_id}.md"``.  If *agent* has no ``session_id``, one is
+        generated via :func:`_make_session_id`.
+
+    Returns
+    -------
+    Path
+        The path that was written.
+    """
+    # Resolve path
+    if path is None:
+        sid = getattr(agent, "session_id", None)
+        if sid is None:
+            sid = _make_session_id()
+            agent.session_id = sid
+        path = _sessions_dir(agent.root) / f"{sid}.md"
+    else:
+        path = Path(path)
+
+    # Determine mode
+    if getattr(agent, "megaswarm", False):
+        mode = "megaswarm"
+    elif getattr(agent, "swarm", False):
+        mode = "swarm"
+    else:
+        mode = "solo"
+
+    cost = agent.estimated_cost()
+    exported_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+    # Build Markdown
+    lines: list[str] = []
+    lines.append("# DevBot Session Export")
+    lines.append(f"**Model:** {agent.model}")
+    lines.append(f"**Mode:** {mode}")
+    lines.append(f"**Session tokens:** {agent.total_tokens:,}")
+    lines.append(f"**Estimated cost:** ${cost:.2f}")
+    lines.append(f"**Session ID:** {getattr(agent, 'session_id', 'N/A')}")
+    lines.append(f"**Exported:** {exported_ts}")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    messages = getattr(agent, "messages", []) or []
+
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        # Skip system messages
+        if role == "system":
+            i += 1
+            continue
+
+        if role == "user":
+            lines.append("### User")
+            lines.append(_redact_md(str(content)))
+            lines.append("")
+
+        elif role == "assistant":
+            lines.append("### Assistant")
+            # content may be None when only tool_calls are present
+            if content:
+                lines.append(_redact_md(str(content)))
+                lines.append("")
+
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                lines.append("**Tool calls:**")
+                for tc in tool_calls:
+                    # Redact args before rendering
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "?")
+                    raw_args = fn.get("arguments", "{}")
+                    try:
+                        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    except json.JSONDecodeError:
+                        args = raw_args
+                    redacted = _redact_value_md(args)
+                    block = json.dumps(
+                        {"name": name, "arguments": redacted},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    lines.append("```json")
+                    lines.append(block)
+                    lines.append("```")
+                    lines.append("")
+
+            # Look ahead for tool-result messages that follow this assistant
+            # message.  Each tool-result message has a tool_call_id that pairs
+            # with one of the tool_calls above.
+            j = i + 1
+            while j < len(messages) and messages[j].get("role") == "tool":
+                tmsg = messages[j]
+                tool_name = tmsg.get("name", tmsg.get("tool_call_id", "?"))
+                result = str(tmsg.get("content", ""))
+                truncated = _truncate_result(_redact_md(result))
+                lines.append(f"**Tool result** (`{tool_name}`):")
+                lines.append("```")
+                lines.append(truncated)
+                lines.append("```")
+                lines.append("")
+                j += 1
+
+            # Skip over the tool messages we just rendered
+            i = j
+            continue
+
+        i += 1
+
+    # Ensure directory exists and write
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def _redact_value_md(val):
+    """Recursively redact API-key-looking strings in *val* (dict/list/str).
+
+    Same logic as devlog._redact_value but standalone to avoid a circular import.
+    Uses ``.search()`` (not ``.match()``) so keys embedded in larger strings are
+    caught.
+    """
+    if isinstance(val, str):
+        return _API_KEY_RX.sub("<REDACTED:API_KEY>", val)
+    if isinstance(val, dict):
+        return {k: _redact_value_md(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_redact_value_md(v) for v in val]
+    return val

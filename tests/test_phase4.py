@@ -468,3 +468,347 @@ class TestGlobalTokenBudget:
         assert result is False
         # Phase 1 ran (call 1 returned False), phase 2 check returned True
         assert call_count[0] == 2
+
+
+# ============================================================================
+# 7. Markdown export (export_markdown)
+# ============================================================================
+
+class TestExportMarkdown:
+    """Tests for export_markdown function."""
+
+    @staticmethod
+    def _make_fake_agent(tmp_path, **overrides):
+        """Create a bare Agent (no __init__, no API calls) with defaults."""
+        agent = Agent.__new__(Agent)
+        agent.label = None
+        agent.root = tmp_path
+        agent.model = "deepseek-v4-flash"
+        agent.swarm = False
+        agent.megaswarm = False
+        agent.total_tokens = 1234
+        agent.session_id = "session-test123"
+        agent.messages = []
+        for attr, val in overrides.items():
+            setattr(agent, attr, val)
+        return agent
+
+    # ------------------------------------------------------------------
+    # Basic conversation
+    # ------------------------------------------------------------------
+
+    def test_export_basic_conversation(self, tmp_path):
+        """Export a simple conversation with user/assistant messages."""
+        agent = self._make_fake_agent(tmp_path, messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello!"},
+            {"role": "assistant", "content": "Hi there! How can I help?"},
+        ])
+
+        from devbot.session import export_markdown
+        out = export_markdown(agent, tmp_path / "export.md")
+
+        assert out.is_file()
+        text = out.read_text(encoding="utf-8")
+
+        # Header
+        assert "# DevBot Session Export" in text
+        assert "**Model:** deepseek-v4-flash" in text
+        assert "**Mode:** solo" in text
+        assert "**Session tokens:** 1,234" in text
+        assert "**Estimated cost:**" in text
+        assert "**Session ID:** session-test123" in text
+        assert "**Exported:**" in text
+
+        # System message is skipped
+        assert "You are a helpful assistant" not in text
+
+        # User message present
+        assert "### User" in text
+        assert "Hello!" in text
+
+        # Assistant message present
+        assert "### Assistant" in text
+        assert "Hi there! How can I help?" in text
+
+    # ------------------------------------------------------------------
+    # Tool calls
+    # ------------------------------------------------------------------
+
+    def test_export_with_tool_calls(self, tmp_path):
+        """Tool calls and tool results are rendered as fenced blocks."""
+        agent = self._make_fake_agent(tmp_path, messages=[
+            {"role": "system", "content": "System prompt."},
+            {"role": "user", "content": "read file x"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path": "/tmp/x.txt"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "read_file",
+                "content": "file contents here",
+            },
+            {"role": "assistant", "content": "The file says: file contents here"},
+        ])
+
+        from devbot.session import export_markdown
+        out = export_markdown(agent, tmp_path / "export.md")
+        text = out.read_text(encoding="utf-8")
+
+        # Tool call block
+        assert "**Tool calls:**" in text
+        assert "```json" in text
+        assert '"read_file"' in text
+        assert '"/tmp/x.txt"' in text
+
+        # Tool result block
+        assert "**Tool result** (`read_file`):" in text
+        assert "file contents here" in text
+
+        # Final assistant response
+        assert "The file says: file contents here" in text
+
+    # ------------------------------------------------------------------
+    # API key redaction
+    # ------------------------------------------------------------------
+
+    def test_export_redacts_api_key(self, tmp_path):
+        """API keys in messages are redacted."""
+        agent = self._make_fake_agent(tmp_path, messages=[
+            {"role": "system", "content": "System."},
+            {"role": "user", "content": "My key is sk-abc123DEF456"},
+            {"role": "assistant", "content": "Got it, sk-xyz999ZZZ888"},
+        ])
+
+        from devbot.session import export_markdown
+        out = export_markdown(agent, tmp_path / "export.md")
+        text = out.read_text(encoding="utf-8")
+
+        assert "<REDACTED:API_KEY>" in text
+        assert "sk-abc123DEF456" not in text
+        assert "sk-xyz999ZZZ888" not in text
+
+    def test_export_redacts_api_key_in_tool_args(self, tmp_path):
+        """API keys inside tool call arguments are redacted."""
+        agent = self._make_fake_agent(tmp_path, messages=[
+            {"role": "system", "content": "Sys."},
+            {"role": "user", "content": "set the key"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "run_command",
+                            "arguments": '{"command": "echo sk-deadbeef123"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "name": "run_command",
+                "content": "ok",
+            },
+        ])
+
+        from devbot.session import export_markdown
+        out = export_markdown(agent, tmp_path / "export.md")
+        text = out.read_text(encoding="utf-8")
+
+        assert "<REDACTED:API_KEY>" in text
+        assert "sk-deadbeef123" not in text
+
+    # ------------------------------------------------------------------
+    # Truncation
+    # ------------------------------------------------------------------
+
+    def test_export_tool_result_truncation(self, tmp_path):
+        """Long tool results are truncated to 500 chars and 10 lines."""
+        # Build a result > 500 chars and > 10 lines
+        long_line = "x" * 80 + "\n"
+        long_result = long_line * 20  # 20 lines, 1620 chars
+
+        agent = self._make_fake_agent(tmp_path, messages=[
+            {"role": "system", "content": "Sys."},
+            {"role": "user", "content": "run"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path": "/big"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "name": "read_file",
+                "content": long_result,
+            },
+        ])
+
+        from devbot.session import export_markdown
+        out = export_markdown(agent, tmp_path / "export.md")
+        text = out.read_text(encoding="utf-8")
+
+        # Should have truncation marker
+        assert "... (truncated)" in text
+
+        # The full long result should NOT appear completely
+        # (it's 1620 chars, truncated at 500)
+        assert long_result not in text
+
+    def test_export_tool_result_under_limit_not_truncated(self, tmp_path):
+        """Short tool results are not truncated."""
+        short = "short result"
+
+        agent = self._make_fake_agent(tmp_path, messages=[
+            {"role": "system", "content": "Sys."},
+            {"role": "user", "content": "run"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path": "/small"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "name": "read_file",
+                "content": short,
+            },
+        ])
+
+        from devbot.session import export_markdown
+        out = export_markdown(agent, tmp_path / "export.md")
+        text = out.read_text(encoding="utf-8")
+
+        assert "short result" in text
+        assert "... (truncated)" not in text
+
+    # ------------------------------------------------------------------
+    # Default path
+    # ------------------------------------------------------------------
+
+    def test_export_default_path(self, tmp_path):
+        """Default path uses agent.session_id in .devbot dir."""
+        agent = self._make_fake_agent(tmp_path, messages=[
+            {"role": "system", "content": "Sys."},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hey"},
+        ])
+
+        from devbot.session import export_markdown
+        out = export_markdown(agent)  # no path arg
+
+        expected = tmp_path / ".devbot" / "session-test123.md"
+        assert out == expected
+        assert out.is_file()
+
+    def test_export_default_path_generates_session_id(self, tmp_path):
+        """When agent has no session_id, one is generated."""
+        agent = self._make_fake_agent(tmp_path, session_id=None, messages=[
+            {"role": "system", "content": "Sys."},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hey"},
+        ])
+
+        from devbot.session import export_markdown
+        out = export_markdown(agent)
+
+        assert out.parent == tmp_path / ".devbot"
+        assert out.suffix == ".md"
+        assert out.stem.startswith("session-")
+        assert out.is_file()
+        # The agent should now have a session_id
+        assert agent.session_id is not None
+        assert agent.session_id.startswith("session-")
+
+    # ------------------------------------------------------------------
+    # Mode detection
+    # ------------------------------------------------------------------
+
+    def test_export_mode_solo(self, tmp_path):
+        agent = self._make_fake_agent(tmp_path, swarm=False, megaswarm=False, messages=[
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": "y"},
+        ])
+        from devbot.session import export_markdown
+        out = export_markdown(agent, tmp_path / "mode.md")
+        text = out.read_text(encoding="utf-8")
+        assert "**Mode:** solo" in text
+
+    def test_export_mode_swarm(self, tmp_path):
+        agent = self._make_fake_agent(tmp_path, swarm=True, megaswarm=False, messages=[
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": "y"},
+        ])
+        from devbot.session import export_markdown
+        out = export_markdown(agent, tmp_path / "mode.md")
+        text = out.read_text(encoding="utf-8")
+        assert "**Mode:** swarm" in text
+
+    def test_export_mode_megaswarm(self, tmp_path):
+        agent = self._make_fake_agent(tmp_path, swarm=True, megaswarm=True, messages=[
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": "y"},
+        ])
+        from devbot.session import export_markdown
+        out = export_markdown(agent, tmp_path / "mode.md")
+        text = out.read_text(encoding="utf-8")
+        assert "**Mode:** megaswarm" in text
+
+    # ------------------------------------------------------------------
+    # Empty messages
+    # ------------------------------------------------------------------
+
+    def test_export_empty_messages(self, tmp_path):
+        """Exporting an agent with no (non-system) messages produces valid
+        Markdown with just the header."""
+        agent = self._make_fake_agent(tmp_path, messages=[
+            {"role": "system", "content": "Only system message."},
+        ])
+        from devbot.session import export_markdown
+        out = export_markdown(agent, tmp_path / "empty.md")
+        text = out.read_text(encoding="utf-8")
+        assert "# DevBot Session Export" in text
+        assert "### User" not in text
+        assert "### Assistant" not in text
+
+    def test_export_none_messages(self, tmp_path):
+        """Exporting an agent with messages=None doesn't crash."""
+        agent = self._make_fake_agent(tmp_path, messages=None)
+        from devbot.session import export_markdown
+        out = export_markdown(agent, tmp_path / "none.md")
+        text = out.read_text(encoding="utf-8")
+        assert "# DevBot Session Export" in text

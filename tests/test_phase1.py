@@ -620,3 +620,161 @@ class TestRecursiveGlob:
         assert "a/mid.txt" in result
         assert "a/b/deep.txt" in result
         assert "other.py" not in result
+
+
+# ============================================================================
+# 10. .gitignore-aware search helpers
+# ============================================================================
+
+class TestGitignoreHelper:
+    """Tests for _parse_gitignore and _is_gitignored."""
+
+    def test_no_gitignore_returns_empty(self, tmp_path):
+        """When .gitignore doesn't exist, both lists are empty."""
+        from devbot.tools import _parse_gitignore
+        fp, dp = _parse_gitignore(tmp_path)
+        assert fp == []
+        assert dp == []
+
+    def test_empty_gitignore_returns_empty(self, tmp_path):
+        """When .gitignore is empty, both lists are empty."""
+        from devbot.tools import _parse_gitignore
+        (tmp_path / ".gitignore").write_text("")
+        fp, dp = _parse_gitignore(tmp_path)
+        assert fp == []
+        assert dp == []
+
+    def test_parses_file_and_dir_patterns(self, tmp_path):
+        """File and directory patterns are correctly separated."""
+        from devbot.tools import _parse_gitignore
+        (tmp_path / ".gitignore").write_text(
+            "*.pyc\n"
+            "__pycache__/\n"
+            ".env\n"
+            "build/\n"
+            "dist/\n"
+            "# comment\n"
+            "\n"
+        )
+        fp, dp = _parse_gitignore(tmp_path)
+        assert "*.pyc" in fp
+        assert ".env" in fp
+        assert "__pycache__" in dp
+        assert "build" in dp
+        assert "dist" in dp
+        # Comments and blanks are excluded
+        assert "# comment" not in fp and "# comment" not in dp
+
+    def test_is_gitignored_dir_pattern(self):
+        """A file under a gitignored directory matches."""
+        from devbot.tools import _is_gitignored
+        assert _is_gitignored("build/output.txt", [], ["build"]) is True
+        assert _is_gitignored("src/build/output.txt", [], ["build"]) is True
+        assert _is_gitignored("src/main.py", [], ["build"]) is False
+
+    def test_is_gitignored_file_pattern(self):
+        """A file matching a file pattern is gitignored."""
+        from devbot.tools import _is_gitignored
+        assert _is_gitignored("module.pyc", ["*.pyc"], []) is True
+        assert _is_gitignored("sub/module.pyc", ["*.pyc"], []) is True
+        assert _is_gitignored("module.py", ["*.pyc"], []) is False
+
+    def test_is_gitignored_both_patterns(self):
+        """Combined dir and file patterns work together."""
+        from devbot.tools import _is_gitignored
+        assert _is_gitignored("dist/app.pyc", ["*.pyc"], ["dist"]) is True
+        assert _is_gitignored("dist/app.py", ["*.pyc"], ["dist"]) is True
+        assert _is_gitignored("src/app.pyc", ["*.pyc"], ["dist"]) is True
+        assert _is_gitignored("src/app.py", ["*.pyc"], ["dist"]) is False
+
+
+# ============================================================================
+# 11. .gitignore-aware grep / find_files integration
+# ============================================================================
+
+class TestGitignoreIntegration:
+    """Integration tests: grep and find_files respect .gitignore."""
+
+    def test_grep_skips_gitignored_file(self, tmp_path):
+        """grep excludes files matching .gitignore patterns."""
+        (tmp_path / ".gitignore").write_text("*.pyc\n")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("TODO")
+        (tmp_path / "src" / "main.pyc").write_text("TODO")  # gitignored
+        result = grep(r"TODO", tmp_path)
+        # Normalize backslashes
+        result = result.replace("\\", "/")
+        assert "main.py" in result
+        assert "main.pyc" not in result
+
+    def test_find_files_skips_gitignored_file(self, tmp_path):
+        """find_files excludes files matching .gitignore patterns."""
+        (tmp_path / ".gitignore").write_text("*.pyc\n")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "valid.py").write_text("")
+        (tmp_path / "src" / "ignored.pyc").write_text("")  # gitignored
+        result = find_files("*.py*", tmp_path)
+        result = result.replace("\\", "/")
+        assert "valid.py" in result
+        assert "ignored.pyc" not in result
+
+    def test_grep_respect_gitignore_false_includes_ignored(self, tmp_path):
+        """With respect_gitignore=False, gitignored files are included."""
+        (tmp_path / ".gitignore").write_text("*.pyc\n")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("TODO")
+        (tmp_path / "src" / "main.pyc").write_text("TODO")
+        result = grep(r"TODO", tmp_path, respect_gitignore=False)
+        result = result.replace("\\", "/")
+        assert "main.py" in result
+        assert "main.pyc" in result
+
+    def test_find_files_respect_gitignore_false_includes_ignored(self, tmp_path):
+        """With respect_gitignore=False, gitignored files are included."""
+        (tmp_path / ".gitignore").write_text("*.pyc\n")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "valid.py").write_text("")
+        (tmp_path / "src" / "ignored.pyc").write_text("")
+        result = find_files("*.py*", tmp_path, respect_gitignore=False)
+        result = result.replace("\\", "/")
+        assert "valid.py" in result
+        assert "ignored.pyc" in result
+
+    def test_gitignore_dir_pattern_skips_all_under(self, tmp_path):
+        """A .gitignore dir pattern (build/) skips all files under that dir."""
+        (tmp_path / ".gitignore").write_text("build/\n")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("hello")
+        (tmp_path / "build").mkdir()
+        (tmp_path / "build" / "output.txt").write_text("hello")
+        result = grep(r"hello", tmp_path)
+        result = result.replace("\\", "/")
+        assert "src/main.py" in result
+        assert "build" not in result
+
+    def test_no_gitignore_no_effect(self, tmp_path):
+        """When .gitignore doesn't exist, all files are searched normally."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("TODO")
+        (tmp_path / "src" / "compiled.pyc").write_text("TODO")
+        result = grep(r"TODO", tmp_path)
+        result = result.replace("\\", "/")
+        assert "main.py" in result
+        assert "compiled.pyc" in result
+
+    def test_dispatch_passes_respect_gitignore(self, tmp_path):
+        """dispatch correctly passes respect_gitignore to grep/find_files."""
+        (tmp_path / ".gitignore").write_text("*.pyc\n")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("TODO")
+        (tmp_path / "src" / "main.pyc").write_text("TODO")
+        # Default: respect_gitignore=True → pyc skipped
+        result_default = dispatch("grep", {"pattern": "TODO", "path": "src"}, tmp_path)
+        result_default = result_default.replace("\\", "/")
+        assert "main.py" in result_default
+        assert "main.pyc" not in result_default
+        # Explicit False → pyc included
+        result_include = dispatch("grep", {"pattern": "TODO", "path": "src", "respect_gitignore": False}, tmp_path)
+        result_include = result_include.replace("\\", "/")
+        assert "main.py" in result_include
+        assert "main.pyc" in result_include

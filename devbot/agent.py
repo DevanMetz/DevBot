@@ -73,10 +73,10 @@ DEFAULT_MAX_TURNS = 200  # tool-loop cap per message; override with DEVBOT_MAX_T
 # page. deepseek-chat / deepseek-reasoner are legacy aliases for V4-flash and
 # share its pricing. Cost estimates are approximate (cache hits cost less).
 MODEL_PRICING = {
-    "deepseek-v4-flash":  {"input": 0.14, "output": 0.28},
-    "deepseek-v4-pro":    {"input": 0.435, "output": 0.87},
-    "deepseek-chat":      {"input": 0.14, "output": 0.28},
-    "deepseek-reasoner":  {"input": 0.14, "output": 0.28},
+    "deepseek-v4-flash":  {"input": 0.14, "output": 0.28, "cache_hit_input": 0.014},
+    "deepseek-v4-pro":    {"input": 0.435, "output": 0.87, "cache_hit_input": 0.0435},
+    "deepseek-chat":      {"input": 0.14, "output": 0.28, "cache_hit_input": 0.014},
+    "deepseek-reasoner":  {"input": 0.14, "output": 0.28, "cache_hit_input": 0.014},
 }
 
 SYSTEM_PROMPT = """\
@@ -176,6 +176,9 @@ class Agent:
         self.label = label  # output prefix for sub-agents, e.g. "coder"
         self.max_turns = int(os.environ.get("DEVBOT_MAX_TURNS", DEFAULT_MAX_TURNS))
         self.total_tokens = 0          # cumulative across the session
+        self.completion_tokens = 0     # cumulative output tokens
+        self.prompt_cache_hit_tokens = 0   # cumulative cache-hit input tokens
+        self.prompt_cache_miss_tokens = 0  # cumulative cache-miss input tokens
         self.last_prompt_tokens = 0    # prompt size of the most recent call
         self.delegation_count = 0      # number of specialist delegations (swarm)
         self._compressed = False       # suppress repeated context-warning spam
@@ -184,6 +187,11 @@ class Agent:
         self.allow_shell = os.environ.get("DEVBOT_ALLOW_SHELL", "").lower() in ("1", "true")
         self.token_budget = int(os.environ.get("DEVBOT_TOKEN_BUDGET", "0") or "0")
         self._budget_exhausted = False
+        self.loop_limit = int(os.environ.get("DEVBOT_LOOP_LIMIT", "3"))
+        self._last_call_sig = None      # tuple of (name, args_str) for loop detection
+        self._same_call_count = 0
+        self._last_error = None         # last error string for error-loop detection
+        self._same_error_count = 0
 
         self.tool_schemas = list(tool_schemas) if tool_schemas is not None else list(TOOL_SCHEMAS)
         if swarm or megaswarm:  # the manager gets the delegate + pipeline tools
@@ -275,16 +283,55 @@ class Agent:
             from .session import save_session
             save_session(self)
 
+    def _check_error_loop(self, result: str) -> bool:
+        """Check for repeated identical errors.  Returns True if the agent
+        should halt because the same error has been seen *loop_limit* times
+        in a row."""
+        if self.loop_limit <= 0:
+            return False
+        if not result.startswith("Error"):
+            # Non-error result breaks any error streak.
+            self._last_error = None
+            self._same_error_count = 0
+            return False
+        if result == self._last_error:
+            self._same_error_count += 1
+            if self._same_error_count >= self.loop_limit:
+                self._safe_print(
+                    f"[devbot] Stuck error loop detected: same error "
+                    f"repeated {self._same_error_count} times. Halting."
+                )
+                return True
+        else:
+            self._same_error_count = 1
+            self._last_error = result
+        return False
+
     def estimated_cost(self) -> float:
         """Estimated USD cost of the session.
 
-        Uses a 50/50 input/output split heuristic since we only track total
-        tokens (not input vs output separately). If the model isn't in the
-        pricing table, defaults to deepseek-v4-flash prices.
+        Uses real input/output/cache-hit breakdown when available from the API;
+        falls back to a 50/50 input/output split heuristic when only total
+        tokens are tracked. If the model isn't in the pricing table, defaults
+        to deepseek-v4-flash prices.
         """
         pricing = MODEL_PRICING.get(self.model, MODEL_PRICING["deepseek-v4-flash"])
         input_price = pricing["input"] / 1_000_000
         output_price = pricing["output"] / 1_000_000
+        cache_hit_input_price = pricing.get("cache_hit_input", input_price) / 1_000_000
+
+        # If we have a real usage breakdown, use it
+        completion = getattr(self, "completion_tokens", 0)
+        cache_hit = getattr(self, "prompt_cache_hit_tokens", 0)
+        cache_miss = getattr(self, "prompt_cache_miss_tokens", 0)
+        if completion > 0 or cache_hit > 0 or cache_miss > 0:
+            # Use the detailed breakdown
+            output_cost = completion * output_price
+            cache_hit_cost = cache_hit * cache_hit_input_price
+            cache_miss_cost = cache_miss * input_price
+            return cache_hit_cost + cache_miss_cost + output_cost
+
+        # Fallback: 50/50 split heuristic (no breakdown available)
         half = self.total_tokens / 2
         return half * input_price + half * output_price
 
@@ -293,6 +340,13 @@ class Agent:
 
         Returns the model's final assistant text (used as the result when this
         agent is a delegated specialist)."""
+        # Reset per-run loop-detection state so counters don't leak across
+        # successive invocations (e.g. the CLI REPL calls run() repeatedly).
+        self._last_call_sig = None
+        self._same_call_count = 0
+        self._last_error = None
+        self._same_error_count = 0
+
         self.messages.append({"role": "user", "content": user_input})
 
         if check_global_budget_exceeded():
@@ -314,6 +368,26 @@ class Agent:
 
         for _ in range(self.max_turns):
             text, tool_calls = self._stream_once()
+
+            # --- stuck-loop detection (identical tool calls) ---
+            if self.loop_limit > 0 and tool_calls:
+                sig = tuple((tc["function"]["name"],
+                             json.dumps(
+                                 json.loads(tc["function"]["arguments"] or "{}"),
+                                 sort_keys=True))
+                             for tc in tool_calls)
+                if sig == self._last_call_sig:
+                    self._same_call_count += 1
+                    if self._same_call_count >= self.loop_limit:
+                        self._safe_print(
+                            f"[devbot] Stuck loop detected: same tool call "
+                            f"repeated {self._same_call_count} times. Halting."
+                        )
+                        self._auto_save()
+                        return text or ""
+                else:
+                    self._same_call_count = 1
+                    self._last_call_sig = sig
 
             if self._budget_exhausted:
                 if check_global_budget_exceeded():
@@ -350,6 +424,9 @@ class Agent:
                         raw_args = tc["function"]["arguments"]
                         result = (f"Error: failed to parse tool arguments as JSON. "
                                   f"Raw arguments string: {raw_args!r}")
+                        if self._check_error_loop(result):
+                            self._auto_save()
+                            return text or ""
                         if tc["id"]:
                             self.messages.append({
                                 "role": "tool",
@@ -394,6 +471,10 @@ class Agent:
                     else:
                         self.on_tool_start(name, args)
                         result = dispatch(name, args, self.root)
+
+                    if self._check_error_loop(result):
+                        self._auto_save()
+                        return text or ""
 
                     log_tool_call(name, args, result, ok=not result.startswith("Error"))
                     self.on_tool_end(result)
@@ -449,10 +530,22 @@ class Agent:
         for chunk in stream:
             # Final chunk (include_usage) carries token counts and no choices.
             if getattr(chunk, "usage", None):
-                self.last_prompt_tokens = chunk.usage.prompt_tokens
-                self.total_tokens += chunk.usage.total_tokens
+                usage = chunk.usage
+                self.last_prompt_tokens = usage.prompt_tokens
+                self.total_tokens += usage.total_tokens
+                # Accumulate usage breakdown for accurate cost estimation
+                ct = getattr(usage, "completion_tokens", 0)
+                if isinstance(ct, int):
+                    self.completion_tokens += ct
+                if hasattr(usage, "prompt_cache_hit_tokens"):
+                    ht = getattr(usage, "prompt_cache_hit_tokens", 0)
+                    mt = getattr(usage, "prompt_cache_miss_tokens", 0)
+                    if isinstance(ht, int):
+                        self.prompt_cache_hit_tokens += ht
+                    if isinstance(mt, int):
+                        self.prompt_cache_miss_tokens += mt
                 global _GLOBAL_TOKEN_COUNT
-                _GLOBAL_TOKEN_COUNT += chunk.usage.total_tokens
+                _GLOBAL_TOKEN_COUNT += usage.total_tokens
                 if self.token_budget > 0 and self.total_tokens >= self.token_budget:
                     self._budget_exhausted = True
                 if check_global_budget_exceeded():

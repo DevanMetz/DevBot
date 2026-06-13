@@ -7,6 +7,27 @@ from pathlib import Path
 # Enable arrow-key history/editing in the REPL when available. The stdlib
 # `readline` ships on Linux/macOS; on Windows it comes from `pyreadline3`.
 # Either way it auto-hooks input() on import, so we just try and move on.
+# Module-level list of slash commands used by both the completer and the REPL loop.
+_SLASH_COMMANDS = [
+    "/help", "/clear", "/stats", "/model", "/think", "/swarm", "/megaswarm",
+    "/resume", "/sessions", "/exit", "/tools", "/cost", "/export",
+]
+
+
+def _slash_completer(text: str, state: int) -> str | None:
+    """Readline completer for slash commands.  Returns the *state*-th match
+    (0-indexed) for the given *text* prefix, or None when exhausted.
+
+    When *text* is already an exact, complete command there are no further
+    completions — the user doesn't need tab for that command."""
+    if text in _SLASH_COMMANDS:
+        return None
+    matches = [cmd for cmd in _SLASH_COMMANDS if cmd.startswith(text)]
+    if state < len(matches):
+        return matches[state]
+    return None
+
+
 def _setup_readline(history_path=None, marker_path=None):
     if history_path is None:
         history_path = Path.home() / ".devbot_history"
@@ -21,6 +42,8 @@ def _setup_readline(history_path=None, marker_path=None):
         except (FileNotFoundError, OSError):
             pass
         readline.set_history_length(1000)
+        readline.set_completer(_slash_completer)
+        readline.parse_and_bind("tab: complete")
         try:
             atexit.register(lambda: readline.write_history_file(history_path))
         except Exception:
@@ -68,6 +91,9 @@ Commands:
   /megaswarm     toggle megaswarm mode (3 parallel agents + reviewer; resets conversation)
   /resume [id]   reload a saved session (latest if no id given)
   /sessions      list saved sessions with timestamps and token counts
+  /tools         list available tool names
+  /cost          show estimated session cost and token total
+  /export [path] export conversation to Markdown (default: .devbot/<session-id>.md)
   /exit          quit"""
 
 BANNER = """\x1b[1m
@@ -224,6 +250,26 @@ def main():
                     sid_short = s["id"].replace("session-", "")[:17]
                     print(f"  {sid_short}  {created}  {s['model']:24s}  "
                           f"{s['total_tokens']:>10,}t  {s['message_count']:>4}msgs  {mode}")
+            continue
+        if user == "/tools":
+            names = sorted(tc["function"]["name"] for tc in agent.tool_schemas)
+            print("Available tools:")
+            for name in names:
+                print(f"  {name}")
+            continue
+        if user == "/cost":
+            cost = agent.estimated_cost()
+            print(f"Estimated cost: ${cost:.2f} | Session tokens: {agent.total_tokens:,}")
+            continue
+        if user.startswith("/export"):
+            parts = user.split(maxsplit=1)
+            path_arg = parts[1].strip() if len(parts) == 2 and parts[1].strip() else None
+            from .session import export_markdown
+            try:
+                out_path = export_markdown(agent, path_arg)
+                print(f"Exported to {out_path}")
+            except Exception as e:
+                print(f"\x1b[31m[error] Export failed: {e}\x1b[0m", file=sys.stderr)
             continue
         if user.startswith("/resume"):
             parts = user.split(maxsplit=1)

@@ -121,6 +121,53 @@ def _glob_match(path_str: str, pattern: str) -> bool:
     return _match_segments(0, 0)
 
 
+def _parse_gitignore(root: Path) -> tuple[list[str], list[str]]:
+    """Parse ``root / ".gitignore"`` and return (file_patterns, dir_patterns).
+
+    * Blank lines and lines starting with ``#`` are ignored.
+    * Trailing whitespace and trailing ``/`` are stripped from each pattern.
+    * A pattern that originally ended with ``/`` is a directory-only pattern
+      (e.g. ``__pycache__/`` → dir_patterns).  Everything else is a file
+      pattern (e.g. ``*.pyc`` → file_patterns).
+    * Returns ([], []) when the file does not exist or is empty.
+    """
+    gf = root / ".gitignore"
+    if not gf.is_file():
+        return [], []
+
+    file_patterns: list[str] = []
+    dir_patterns: list[str] = []
+    for raw in gf.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.rstrip()
+        if not line or line.startswith("#"):
+            continue
+        if line.endswith("/"):
+            dir_patterns.append(line[:-1])
+        else:
+            file_patterns.append(line)
+    return file_patterns, dir_patterns
+
+
+def _is_gitignored(rel_path: str, file_patterns: list[str], dir_patterns: list[str]) -> bool:
+    """Return True if *rel_path* (forward-slash normalised) matches any gitignore pattern.
+
+    * *dir_patterns* — a path component exactly equals the pattern → ignored.
+    * *file_patterns* — ``_glob_match(rel_path, pattern)`` → ignored.
+    """
+    # Directory patterns: any path component equals the pattern.
+    for comp in rel_path.split("/"):
+        for dp in dir_patterns:
+            if comp == dp:
+                return True
+
+    # File patterns: use the existing glob engine.
+    for fp in file_patterns:
+        if _glob_match(rel_path, fp):
+            return True
+
+    return False
+
+
 class PathError(Exception):
     """Raised when a path resolves outside the sandboxed project root."""
 
@@ -242,17 +289,23 @@ def list_dir(path: str, root: Path) -> str:
     return _clip("\n".join(entries) or "(empty)")
 
 
-def grep(pattern: str, root: Path, path: str = ".", glob: str = "") -> str:
+def grep(pattern: str, root: Path, path: str = ".", glob: str = "",
+         respect_gitignore: bool = True) -> str:
     base = _resolve(path, root)
     rx = re.compile(pattern)
+    file_pats, dir_pats = ([], [])
+    if respect_gitignore:
+        file_pats, dir_pats = _parse_gitignore(root)
     hits = []
     for dirpath, dirnames, filenames in os.walk(base):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for name in filenames:
+            rel = str((Path(dirpath) / name).relative_to(base)).replace("\\", "/")
             if glob:
-                rel = str((Path(dirpath) / name).relative_to(base)).replace("\\", "/")
                 if not _glob_match(rel, glob):
                     continue
+            if respect_gitignore and _is_gitignored(rel, file_pats, dir_pats):
+                continue
             fp = Path(dirpath) / name
             try:
                 for n, line in enumerate(fp.read_text(encoding="utf-8").splitlines(), 1):
@@ -265,14 +318,20 @@ def grep(pattern: str, root: Path, path: str = ".", glob: str = "") -> str:
     return _clip("\n".join(hits) or "No matches")
 
 
-def find_files(glob: str, root: Path, path: str = ".") -> str:
+def find_files(glob: str, root: Path, path: str = ".",
+               respect_gitignore: bool = True) -> str:
     base = _resolve(path, root)
+    file_pats, dir_pats = ([], [])
+    if respect_gitignore:
+        file_pats, dir_pats = _parse_gitignore(root)
     matches = []
     for dirpath, dirnames, filenames in os.walk(base):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for name in filenames:
             rel = str((Path(dirpath) / name).relative_to(base)).replace("\\", "/")
             if _glob_match(rel, glob):
+                if respect_gitignore and _is_gitignored(rel, file_pats, dir_pats):
+                    continue
                 matches.append(rel)
                 if len(matches) >= 500:
                     return _clip("\n".join(matches) + "\n... [stopped at 500 files]")
@@ -536,6 +595,7 @@ TOOL_SCHEMAS = [
                     "pattern": {"type": "string"},
                     "path": {"type": "string", "description": "Directory to search, default project root"},
                     "glob": {"type": "string", "description": "Filename glob filter, e.g. *.py or src/**/*.py. Supports ** for recursive matching."},
+                    "respect_gitignore": {"type": "boolean", "description": "When True (default), skip files matching .gitignore patterns in the project root."},
                 },
                 "required": ["pattern"],
             },
@@ -551,6 +611,7 @@ TOOL_SCHEMAS = [
                 "properties": {
                     "glob": {"type": "string", "description": "Filename glob, e.g. *.py or **/*.py. Supports ** for recursive matching."},
                     "path": {"type": "string", "description": "Directory to search, default project root"},
+                    "respect_gitignore": {"type": "boolean", "description": "When True (default), skip files matching .gitignore patterns in the project root."},
                 },
                 "required": ["glob"],
             },
@@ -612,9 +673,11 @@ _TOOL_HANDLERS = {
         a["path"], a["old_string"], a["new_string"], r, a.get("replace_all") or False),
     "list_dir": lambda a, r: list_dir(a.get("path") or ".", r),
     "grep": lambda a, r: grep(
-        a["pattern"], r, a.get("path") or ".", a.get("glob") or ""),
+        a["pattern"], r, a.get("path") or ".", a.get("glob") or "",
+        a.get("respect_gitignore", True)),
     "find_files": lambda a, r: find_files(
-        a["glob"], r, a.get("path") or "."),
+        a["glob"], r, a.get("path") or ".",
+        a.get("respect_gitignore", True)),
     "run_command": lambda a, r: run_command(
         a["command"], r, a.get("timeout") or 120),
     "web_search": lambda a, r: web_search(

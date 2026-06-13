@@ -91,6 +91,8 @@ In the REPL:
 - `/megaswarm` — toggle megaswarm mode (3 parallel agents + reviewer; resets conversation)
 - `/resume [id]` — reload a saved session (latest if no id given)
 - `/sessions` — list saved sessions with timestamps and token counts
+- `/tools` — list available tool names
+- `/cost` — show estimated session cost and token total
 - `/exit` — quit
 
 DevBot tracks token usage per call and warns (and auto-compresses) when a prompt
@@ -188,6 +190,7 @@ integrates the results.
 | `DEVBOT_SHOW_REASONING` | Show chain-of-thought (`1`, `true`, `yes`) | off |
 | `DEVBOT_ALLOW_SHELL` | Skip shell approval for allow-listed commands (`1`, `true`) | off |
 | `DEVBOT_LOG` | Path for JSONL structured log | off (no logging) |
+| `DEVBOT_LOOP_LIMIT` | Consecutive identical tool calls / errors before halting (0 = off) | 3 |
 
 You can also put these in a `.env` file in your project root instead of exporting them:
 

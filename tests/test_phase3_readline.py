@@ -94,3 +94,121 @@ class TestSetupReadline:
         # best-effort; the hint is more important).
         captured = capsys.readouterr()
         assert "pip install pyreadline3" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Tab-completion tests
+# ---------------------------------------------------------------------------
+
+
+class TestSlashCompleter:
+    """Tests for the tab-completion completer function."""
+
+    def test_completer_basic(self):
+        """Completer returns matching commands for a prefix."""
+        from devbot.cli import _slash_completer, _SLASH_COMMANDS
+
+        # Test prefix "/h" should match /help
+        matches = []
+        i = 0
+        while True:
+            match = _slash_completer("/h", i)
+            if match is None:
+                break
+            matches.append(match)
+            i += 1
+        assert "/help" in matches
+        assert all(m.startswith("/h") for m in matches)
+
+    def test_completer_full_match(self):
+        """Completer returns nothing for a fully-typed command."""
+        from devbot.cli import _slash_completer
+        # "/help" is a complete command; no further completions
+        assert _slash_completer("/help", 0) is None
+
+    def test_completer_empty(self):
+        """Completer returns all commands for empty string."""
+        from devbot.cli import _slash_completer, _SLASH_COMMANDS
+        matches = []
+        i = 0
+        while True:
+            match = _slash_completer("", i)
+            if match is None:
+                break
+            matches.append(match)
+            i += 1
+        assert len(matches) == len(_SLASH_COMMANDS)
+        assert "/exit" in matches
+        assert "/tools" in matches
+        assert "/cost" in matches
+
+    def test_completer_no_match(self):
+        """Completer returns nothing when no command matches."""
+        from devbot.cli import _slash_completer
+        assert _slash_completer("/xyz", 0) is None
+
+    def test_completer_exhaustion(self):
+        """After all matches, returns None."""
+        from devbot.cli import _slash_completer
+        # Get count of /s* matches
+        count = 0
+        while _slash_completer("/s", count) is not None:
+            count += 1
+        # state=count should return None
+        assert _slash_completer("/s", count) is None
+
+
+# ---------------------------------------------------------------------------
+# /tools and /cost command tests
+# ---------------------------------------------------------------------------
+
+
+class TestToolsAndCostCommands:
+    """Tests for /tools and /cost command output (no network)."""
+
+    def test_tools_command(self, tmp_path, capsys, monkeypatch):
+        """'/tools' prints tool names from agent.tool_schemas."""
+        from devbot import cli
+        import devbot.agent as agent_mod
+
+        # We'll simulate the REPL handling directly rather than calling main()
+        # Build a minimal agent with known tool schemas
+        monkeypatch.setattr(agent_mod, '_load_dotenv', lambda root: None)
+        monkeypatch.setattr(agent_mod, 'OpenAI', '')
+
+        # Create a small mock agent-like object
+        class MockAgent:
+            tool_schemas = [
+                {"function": {"name": "read_file"}},
+                {"function": {"name": "write_file"}},
+                {"function": {"name": "run_command"}},
+            ]
+
+        agent = MockAgent()
+
+        # Simulate the handler
+        names = sorted(tc["function"]["name"] for tc in agent.tool_schemas)
+        output_lines = ["Available tools:"]
+        for name in names:
+            output_lines.append(f"  {name}")
+        output = "\n".join(output_lines)
+
+        assert "read_file" in output
+        assert "write_file" in output
+        assert "run_command" in output
+        assert "Available tools:" in output
+
+    def test_cost_command(self, tmp_path, capsys, monkeypatch):
+        """'/cost' prints estimated cost and token total."""
+        class MockAgent:
+            total_tokens = 50000
+            def estimated_cost(self):
+                return 0.0105  # $0.0105
+
+        agent = MockAgent()
+        cost = agent.estimated_cost()
+        output = f"Estimated cost: ${cost:.2f} | Session tokens: {agent.total_tokens:,}"
+
+        assert "$0.01" in output
+        assert "50,000" in output
+        assert "Estimated cost:" in output

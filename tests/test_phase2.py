@@ -530,3 +530,158 @@ class TestDevLogAgentWiring:
         assert ok is expected_ok, (
             f"result={result!r}: expected ok={expected_ok}, got ok={ok}"
         )
+
+
+# ============================================================================
+# 6. Stuck-loop detection (Agent.run loop guard)
+# ============================================================================
+
+class TestStuckLoopDetection:
+    """Tests that repeated identical tool calls / errors halt the agent."""
+
+    # -- helpers ---------------------------------------------------------------
+
+    @staticmethod
+    def _make_tc(name: str, args_str: str, tc_id: str = "tc-1"):
+        """Build a single tool-call dict as returned by _stream_once."""
+        return [{
+            "id": tc_id,
+            "type": "function",
+            "function": {"name": name, "arguments": args_str},
+        }]
+
+    @staticmethod
+    def _stream_stub(responses):
+        """Return a _stream_once stub that yields successive *responses*.
+
+        Each element of *responses* is a ``(text, tool_calls)`` tuple.
+        When exhausted the stub returns ``("", None)``.
+        """
+        it = iter(responses)
+        def _stream_once():
+            try:
+                return next(it)
+            except StopIteration:
+                return "", None
+        return _stream_once
+
+    # -- tests ----------------------------------------------------------------
+
+    def test_repeated_tool_call_halted(self, tmp_path, monkeypatch, capsys):
+        """After *loop_limit* identical tool-call turns the agent halts."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dummy-key")
+        agent = Agent(root=tmp_path)
+
+        tc = self._make_tc("read_file", '{"path": "foo.py"}')
+        # Return the same tool call 4 times — the third should trigger the halt.
+        monkeypatch.setattr(agent, "_stream_once",
+                            self._stream_stub([("", tc), ("", tc), ("", tc), ("", tc)]))
+        monkeypatch.setattr(agent, "_auto_save", lambda: None)
+        monkeypatch.setattr(agent, "on_tool_start", lambda *a: None)
+        monkeypatch.setattr(agent, "on_tool_end", lambda *a: None)
+        monkeypatch.setattr(agent, "on_text", lambda *a: None)
+        monkeypatch.setattr("devbot.agent.dispatch", lambda name, args, root: "ok")
+
+        agent.run("do something")
+        captured = capsys.readouterr().out
+
+        assert "Stuck loop detected" in captured
+        assert "same tool call repeated 3 times" in captured
+
+    def test_different_calls_no_halt(self, tmp_path, monkeypatch, capsys):
+        """Alternating tool calls should NOT trigger the stuck-loop guard."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dummy-key")
+        agent = Agent(root=tmp_path)
+
+        tc_a = self._make_tc("read_file", '{"path": "foo.py"}', tc_id="tc-a")
+        tc_b = self._make_tc("grep", '{"pattern": "hello"}', tc_id="tc-b")
+        # read_file → grep → read_file → done
+        monkeypatch.setattr(agent, "_stream_once",
+                            self._stream_stub([("", tc_a), ("", tc_b), ("", tc_a)]))
+        monkeypatch.setattr(agent, "_auto_save", lambda: None)
+        monkeypatch.setattr(agent, "on_tool_start", lambda *a: None)
+        monkeypatch.setattr(agent, "on_tool_end", lambda *a: None)
+        monkeypatch.setattr(agent, "on_text", lambda *a: None)
+        monkeypatch.setattr("devbot.agent.dispatch", lambda name, args, root: "ok")
+
+        agent.run("do something")
+        captured = capsys.readouterr().out
+
+        assert "Stuck loop detected" not in captured
+
+    def test_repeated_error_halted(self, tmp_path, monkeypatch, capsys):
+        """Same error string repeated *loop_limit* times halts the agent."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dummy-key")
+        agent = Agent(root=tmp_path)
+
+        # Different tool calls each turn so the tool-call loop guard doesn't
+        # fire first, but every dispatch returns the same error.
+        tc1 = self._make_tc("read_file", '{"path": "a.py"}', tc_id="tc-1")
+        tc2 = self._make_tc("read_file", '{"path": "b.py"}', tc_id="tc-2")
+        tc3 = self._make_tc("read_file", '{"path": "c.py"}', tc_id="tc-3")
+
+        monkeypatch.setattr(agent, "_stream_once",
+                            self._stream_stub([("", tc1), ("", tc2), ("", tc3)]))
+        monkeypatch.setattr(agent, "_auto_save", lambda: None)
+        monkeypatch.setattr(agent, "on_tool_start", lambda *a: None)
+        monkeypatch.setattr(agent, "on_tool_end", lambda *a: None)
+        monkeypatch.setattr(agent, "on_text", lambda *a: None)
+        monkeypatch.setattr("devbot.agent.dispatch",
+                            lambda name, args, root: "Error: something broke")
+
+        agent.run("do something")
+        captured = capsys.readouterr().out
+
+        assert "Stuck error loop detected" in captured
+        assert "same error repeated 3 times" in captured
+
+    def test_loop_limit_zero_disables(self, tmp_path, monkeypatch, capsys):
+        """DEVBOT_LOOP_LIMIT=0 disables both loop guards entirely."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dummy-key")
+        monkeypatch.setenv("DEVBOT_LOOP_LIMIT", "0")
+        agent = Agent(root=tmp_path)
+
+        tc = self._make_tc("read_file", '{"path": "foo.py"}')
+        # Return the same tool call 10 times, then stop.
+        responses = [("", tc)] * 10
+        monkeypatch.setattr(agent, "_stream_once",
+                            self._stream_stub(responses))
+        monkeypatch.setattr(agent, "_auto_save", lambda: None)
+        monkeypatch.setattr(agent, "on_tool_start", lambda *a: None)
+        monkeypatch.setattr(agent, "on_tool_end", lambda *a: None)
+        monkeypatch.setattr(agent, "on_text", lambda *a: None)
+        monkeypatch.setattr("devbot.agent.dispatch", lambda name, args, root: "ok")
+
+        agent.run("do something")
+        captured = capsys.readouterr().out
+
+        assert "Stuck loop detected" not in captured
+        assert "Stuck error loop detected" not in captured
+
+    def test_different_errors_no_halt(self, tmp_path, monkeypatch, capsys):
+        """Different error strings each turn should NOT trigger error-loop halt."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-dummy-key")
+        agent = Agent(root=tmp_path)
+
+        tc1 = self._make_tc("read_file", '{"path": "a.py"}', tc_id="tc-1")
+        tc2 = self._make_tc("read_file", '{"path": "b.py"}', tc_id="tc-2")
+        tc3 = self._make_tc("read_file", '{"path": "c.py"}', tc_id="tc-3")
+
+        monkeypatch.setattr(agent, "_stream_once",
+                            self._stream_stub([("", tc1), ("", tc2), ("", tc3)]))
+        monkeypatch.setattr(agent, "_auto_save", lambda: None)
+        monkeypatch.setattr(agent, "on_tool_start", lambda *a: None)
+        monkeypatch.setattr(agent, "on_tool_end", lambda *a: None)
+        monkeypatch.setattr(agent, "on_text", lambda *a: None)
+
+        # Return a different error each time.
+        errors = iter(["Error: something broke",
+                       "Error: another failure",
+                       "Error: yet another problem"])
+        monkeypatch.setattr("devbot.agent.dispatch",
+                            lambda name, args, root: next(errors))
+
+        agent.run("do something")
+        captured = capsys.readouterr().out
+
+        assert "Stuck error loop detected" not in captured
