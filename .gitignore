@@ -1,6 +1,9 @@
 # Secrets — never commit your real key
 .env
 
+# DevBot session persistence
+.devbot/
+
 # Python
 __pycache__/
 *.py[cod]

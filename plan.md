@@ -1,110 +1,114 @@
-# DevBot improvement plan: parallel UX + mass parallelism
+# DevBot self-improvement plan
 
-Three independent, shippable phases. Build in this order. After each phase,
-run a syntax/compile check and (where possible) a smoke test before moving on.
-Prefer `deepseek-v4-flash` while developing to keep cost down.
+Phases are independent and ordered by value. After each phase: run
+`python -m pytest -q` (once Phase 1 lands) plus a syntax/compile check, and
+verify before moving on. Prefer `deepseek-v4-flash` while developing to keep
+cost down. Commit after each phase.
 
 ---
 
-## Phase 1 — Suppress thinking tokens (smallest, do first)
+## Phase 1 — Make the project testable (do first)
 
-**Goal:** stop streaming the model's full chain-of-thought to the terminal by
-default; show a compact, collapsing indicator instead.
-
-**Where:**
-- `devbot/agent.py` — `Agent.__init__` and `Agent._stream_once` (the
-  `reasoning_content` branch).
-- `devbot/cli.py` — a `/think` toggle and a line in `COMMANDS_HELP`.
+The project has `tests/` but no test runner config, and the core file-mutating
+logic is almost entirely untested. Lock it down before changing anything else.
 
 **What to do:**
-- Add `self.show_reasoning` (default `False`), initialized from env var
-  `DEVBOT_SHOW_REASONING` (truthy = on).
-- In `_stream_once`, when `reasoning_content` arrives:
-  - If `show_reasoning` is **off**: do NOT stream the CoT text. Instead update a
-    single in-place line like `💭 thinking… (N tokens)` and clear it when the
-    first real `content` delta arrives.
-  - If **on**: keep the current behavior (full dimmed CoT stream).
-- Reasoning must continue to be excluded from `text_parts` (the saved answer) —
-  this is display-only.
-- Add a `/think` REPL command that toggles `agent.show_reasoning` and prints the
-  new state; add it to `COMMANDS_HELP`.
+- Add `pytest` to `pyproject.toml` as an optional `[dev]` dependency and a
+  `[tool.pytest.ini_options]` section (`testpaths = ["tests"]`).
+- Write unit tests (no network) for the high-risk pure logic in `tools.py`:
+  - `_resolve`: relative path inside root OK; `..` escape and absolute paths
+    outside root raise `PathError`; symlink escape blocked.
+  - `edit_file`: empty `old_string`, missing string (with closest-line hint),
+    non-unique without `replace_all`, successful single + `replace_all`.
+  - `read_file`: negative offset clamps, offset past EOF errors, truncation
+    header appears only when content is clipped.
+  - `grep` / `find_files`: `SKIP_DIRS` pruning; match caps.
+  - `run_command`: `BLOCKED_PATTERNS` rejects dangerous commands.
+  - `dispatch`: unknown tool, null-coerced args.
+- Add tests for `agent._compress_conversation` keep-index logic (no orphaned
+  tool messages) and `_load_dotenv`.
+- Add a GitHub Actions workflow (`.github/workflows/ci.yml`) that runs
+  `pytest -q` on push/PR (Python 3.10–3.13).
 
-**Done when:** a run shows the `thinking…` indicator (not the full CoT) by
-default; `/think` flips it; the model's saved answer is unchanged.
+**Done when:** `pytest -q` passes locally and the CI workflow is committed.
 
 ---
 
-## Phase 2 — Mass-parallelism plumbing (config + safety, no UI)
+## Phase 2 — Harden the shell sandbox
 
-**Goal:** let megaswarm fan out to N agents safely, without tripping rate limits
-or exhausting the HTTP connection pool.
-
-**Where:**
-- `devbot/swarm.py` — `run_megaswarm`, `megadelegate_schema`.
-- `devbot/agent.py` — the shared `OpenAI` client construction.
+`run_command` uses `shell=True` gated only by a regex blocklist — a deny-list is
+the wrong default. Move toward an allow-list / explicit-confirmation model.
 
 **What to do:**
-- Generalize `megadelegate` to accept `n` (number of parallel agents, default 3)
-  and an optional `role` (default the existing trio behavior). Launch N
-  sub-agents; the reviewer still synthesizes all outputs.
-- Cap concurrency: `max_workers = min(n, DEVBOT_MAX_PARALLEL)` where
-  `DEVBOT_MAX_PARALLEL` defaults to 8. Add a `threading.Semaphore` that caps
-  in-flight API calls so we respect DeepSeek's concurrency limits
-  (deepseek-v4-pro = 500, deepseek-v4-flash = 2500).
-- Tune the shared client for many connections:
-  `OpenAI(http_client=httpx.Client(limits=httpx.Limits(max_connections=64,
-  max_keepalive_connections=32)), timeout=httpx.Timeout(120.0, connect=10.0))`.
-- Add a `DEVBOT_TOKEN_BUDGET` guard: once the manager's cumulative tokens exceed
-  it, stop spawning new sub-agents and report the partial result.
-- Keep per-agent failure isolation (one agent's exception must not kill the run).
+- Add a `DEVBOT_ALLOW_SHELL` posture: default to requiring per-command approval
+  even in `-y` mode for commands not on a safe allow-list (git status, ls,
+  pytest, python, npm test, etc.).
+- Surface the full command in the approval prompt (already partly there) and
+  show *why* it was flagged (matched blocklist vs. not on allow-list).
+- Fix the Windows encoding bug: `run_command` decodes subprocess output as UTF-8
+  but `cmd.exe` emits cp1252 — detect the console encoding or use
+  `errors="replace"` consistently and document the limitation.
+- Add tests for the allow-list / block-list decision logic.
 
-**Done when:** `megadelegate(task, n=10)` runs without 429 errors or
-connection-pool warnings, and the token budget aborts cleanly when exceeded.
+**Done when:** a non-allow-listed command prompts even under `-y`; allow-listed
+ones run freely; tests cover the decision matrix.
 
 ---
 
-## Phase 3 — Live parallel dashboard (biggest, do last)
+## Phase 3 — Conversation persistence & resume
 
-**Goal:** show a readable, live, in-place view of what every parallel agent is
-doing — instead of either silence or garbled interleaved output.
-
-**Where:**
-- `devbot/swarm.py` — a new `ParallelMonitor` class; re-point sub-agent hooks in
-  `_run_one` to write to it instead of printing.
+Long sessions (and expensive megaswarm runs) are lost on exit.
 
 **What to do:**
-- `ParallelMonitor` holds a thread-safe `{label: AgentStatus}` where
-  `AgentStatus = {phase, current_tool, last_snippet, tokens, elapsed, state}`.
-- Re-point each sub-agent's hooks:
-  - `on_tool_start` → set `current_tool` + a short snippet (e.g.
-    `⏺ edit_file foo.py`).
-  - `on_text` → keep only the last ~60 chars as a rolling snippet (do NOT
-    accumulate full output).
-  - `on_tool_end` → update state.
-- A renderer redraws a fixed N-line block, throttled to ~10 Hz, using ANSI
-  cursor moves: `\x1b[{N}A` (up N lines) then `\x1b[2K` (clear) per row.
-- When N is large, collapse to a summary line (e.g. "12 agents: 8 running, 3
-  done, 1 failed") plus the few most-recently-active agents.
+- Persist the conversation (`messages`, model, mode, token totals) to
+  `.devbot/session-<id>.json` on each turn.
+- Add `--resume [id]` and a `/resume` command to reload the latest/selected
+  session.
+- Add `/sessions` to list saved sessions with timestamps and token counts.
+- Respect the sandbox: store under the project root; add `.devbot/` to
+  `.gitignore`.
 
-**Must handle:**
-- Pause the renderer while `_CONFIRM_LOCK` holds an interactive prompt (a prompt
-  drawn mid-redraw corrupts the screen).
-- Truncate each line to the terminal width.
-- Non-TTY fallback (CI / piped output): print plain `[label] finished` lines
-  instead of cursor manipulation.
-
-**Done when:** a live 3-agent megaswarm shows one updating line per agent with no
-garble, and Ctrl-C / approval prompts don't corrupt the display.
+**Done when:** quitting mid-task and `devbot --resume` restores the exact
+conversation and stats.
 
 ---
 
-## Cross-cutting notes
+## Phase 4 — Cost & context controls
 
-- Phases 1 and 3 both need an in-place "transient line" rendering helper (cursor
-  move + clear). Build that helper once in Phase 1 and reuse it in Phase 3.
-- Phase 3 is the only phase that genuinely needs a live multi-agent run to
-  verify; Phases 1 and 2 are unit-checkable. Test the dashboard with a cheap
-  throwaway task on `deepseek-v4-flash`, not `-pro`.
-- Respect the existing approval-safety rule: parallel sub-agents auto-approve
-  dangerous tools only when the manager was started with `-y`; otherwise they
-  decline rather than block on stdin.
+Megaswarm runs have hit 1.5M tokens; users need visibility and brakes.
+
+**What to do:**
+- Compression: use a cheaper model for summarization (configurable,
+  default `deepseek-v4-flash`) instead of the active model.
+- Add a per-session `DEVBOT_TOKEN_BUDGET` enforced for the *whole* session (not
+  just one megaswarm), with a clear stop + summary when hit.
+- Show a running cost estimate in `/stats` using the model's per-1M pricing.
+- Warn before a `megadelegate` that would launch more than N agents.
+
+**Done when:** `/stats` shows estimated $ cost; the session budget halts work
+with a clear message; compression uses the cheap model.
+
+---
+
+## Phase 5 — Polish & papercuts
+
+- Windows readline: either bundle `pyreadline3` install guidance prominently or
+  implement a minimal history fallback so the startup warning isn't the first
+  thing users see.
+- `_resolve`/glob: `Path.match` doesn't support `**`; document or implement
+  recursive glob in `grep`/`find_files`.
+- Structured logging: optional `DEVBOT_LOG=path` to tee tool calls + errors to a
+  file (JSONL), separate from the pretty terminal output.
+- Remove the redundant megaswarm semaphore (the `ThreadPoolExecutor` already
+  caps concurrency) or document why it stays.
+
+**Done when:** each papercut is fixed or explicitly documented as a known
+limitation in the README.
+
+---
+
+## Cross-cutting rules
+- Keep the approval-safety invariant: parallel sub-agents auto-approve dangerous
+  tools only with `-y`; otherwise they decline rather than block on stdin.
+- Every new feature ships with tests (post Phase 1) and a README update.
+- Verify with a cheap `deepseek-v4-flash` run before any `deepseek-v4-pro` run.

@@ -19,3 +19,6 @@ devbot = "devbot.cli:main"
 
 [tool.setuptools]
 packages = ["devbot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -55,6 +55,8 @@ Commands:
   /think         toggle display of full chain-of-thought
   /swarm         toggle swarm mode (delegate to specialists; resets conversation)
   /megaswarm     toggle megaswarm mode (3 parallel agents + reviewer; resets conversation)
+  /resume [id]   reload a saved session (latest if no id given)
+  /sessions      list saved sessions with timestamps and token counts
   /exit          quit"""
 
 BANNER = """\x1b[1m
@@ -78,12 +80,31 @@ def main():
                         help="Swarm mode: manager agent can delegate to specialist sub-agents")
     parser.add_argument("-M", "--megaswarm", action="store_true",
                         help="Megaswarm mode: delegates 3 agents in parallel + reviewer synthesis")
+    parser.add_argument("-r", "--resume", nargs="?", const="latest", metavar="ID",
+                        help="Resume a saved session (latest if no ID given)")
     parser.add_argument("--version", action="version", version=f"devbot {__version__}")
     args = parser.parse_args()
 
     root = Path(args.cwd).resolve()
-    agent = Agent(root=root, model=args.model, auto_approve=args.yes,
-                  swarm=args.swarm, megaswarm=args.megaswarm)
+
+    # Handle --resume: restore from a saved session.
+    if args.resume is not None:
+        from .session import restore_agent, list_sessions
+        session_id = None if args.resume == "latest" else args.resume
+        restored = restore_agent(root, session_id=session_id,
+                                 auto_approve=args.yes)
+        if restored is None:
+            if session_id:
+                print(f"[devbot] Session '{session_id}' not found in {root / '.devbot'}", file=sys.stderr)
+            else:
+                print(f"[devbot] No saved sessions found in {root / '.devbot'}", file=sys.stderr)
+            sys.exit(1)
+        agent = restored
+        print(f"[devbot] Resumed session {agent.session_id} "
+              f"({agent.total_tokens:,} tokens, {len(agent.messages)} messages)")
+    else:
+        agent = Agent(root=root, model=args.model, auto_approve=args.yes,
+                      swarm=args.swarm, megaswarm=args.megaswarm)
 
     if args.prompt:  # one-shot mode: devbot "fix the failing test"
         agent.run(" ".join(args.prompt))
@@ -160,6 +181,32 @@ def main():
             agent = Agent(root=root, model=agent.model, auto_approve=agent.auto_approve,
                           swarm=enable, megaswarm=enable)
             print(f"[megaswarm mode: {'on' if enable else 'off'} — conversation reset]")
+            continue
+        if user == "/sessions":
+            from .session import list_sessions
+            sessions = list_sessions(root)
+            if not sessions:
+                print("[no saved sessions]")
+            else:
+                print(f"[{len(sessions)} session(s) in {root / '.devbot'}]")
+                for s in sessions:
+                    mode = "megaswarm" if s["megaswarm"] else ("swarm" if s["swarm"] else "solo")
+                    created = s["created"][:19] if s["created"] else "?"
+                    sid_short = s["id"].replace("session-", "")[:17]
+                    print(f"  {sid_short}  {created}  {s['model']:24s}  "
+                          f"{s['total_tokens']:>10,}t  {s['message_count']:>4}msgs  {mode}")
+            continue
+        if user.startswith("/resume"):
+            parts = user.split(maxsplit=1)
+            sid = parts[1].strip() if len(parts) == 2 and parts[1].strip() else None
+            from .session import restore_agent
+            restored = restore_agent(root, session_id=sid, auto_approve=agent.auto_approve)
+            if restored is None:
+                print(f"[session not found: {sid or 'latest'}]")
+            else:
+                agent = restored
+                print(f"[resumed session {agent.session_id} "
+                      f"({agent.total_tokens:,} tokens, {len(agent.messages)} messages)]")
             continue
         try:
             agent.run(user)

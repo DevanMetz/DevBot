@@ -143,6 +143,37 @@ def run_specialist(manager: "Agent", role: str, task: str) -> str:
     return answer or "(specialist returned no text)"
 
 
+def run_specialist_with_prompt(manager: "Agent", role: str, system_prompt: str,
+                               task: str, label: str | None = None) -> str:
+    """Like run_specialist but with a custom system prompt (keeps the role's tools)."""
+    from .agent import Agent, TOOL_SCHEMAS  # local import avoids circular dependency
+
+    spec = SPECIALISTS.get(role)
+    if spec is None:
+        return f"Error: unknown specialist '{role}'."
+    allowed = spec["tools"]
+    schemas = (TOOL_SCHEMAS if allowed is None
+               else [s for s in TOOL_SCHEMAS if s["function"]["name"] in allowed])
+    lbl = label or role
+    sub = Agent(
+        root=manager.root,
+        model=spec["model"] or manager.model,
+        auto_approve=manager.auto_approve,
+        system_prompt=system_prompt,
+        tool_schemas=schemas,
+        label=lbl,
+    )
+    sub.client = manager.client
+
+    print(f"\n\x1b[35m╭─ [{lbl}]\x1b[0m \x1b[90m{task[:100]}\x1b[0m")
+    start = time.time()
+    answer = sub.run(task)
+    print(f"\n\x1b[35m╰─ [{lbl}] done in {time.time() - start:.1f}s\x1b[0m")
+    manager.total_tokens += sub.total_tokens
+    manager.delegation_count += 1
+    return answer or "(specialist returned no text)"
+
+
 # ---------------------------------------------------------------------------
 #  Megaswarm — 3 agents in parallel → reviewer synthesises
 # ---------------------------------------------------------------------------
@@ -432,32 +463,42 @@ def megadelegate_schema() -> dict:
         "function": {
             "name": "megadelegate",
             "description": (
-                "MEGASWARM: delegate the SAME task to N specialists "
-                f"(default 3: {roles}) running IN PARALLEL. Their independent "
-                "outputs are then fed to a reviewer who synthesises a single "
-                "combined answer. Use this when you want a robust, triangulated "
-                "result for a complex or high-stakes task.\n"
-                "Optional `n` controls parallelism (e.g. 5 for more triangulation). "
-                "Optional `role` launches N copies of that single role instead of "
-                "the default trio."
+                "MEGASWARM: run specialists IN PARALLEL, then a reviewer combines "
+                "their work. Two modes:\n"
+                "1. DIVIDE-AND-CONQUER (preferred for building): pass `subtasks` = "
+                "a list of INDEPENDENT subtasks that touch DIFFERENT files/areas. "
+                "Each runs concurrently (role defaults to coder), then the reviewer "
+                "integrates them. Use this to actually get more done in parallel.\n"
+                f"2. TRIANGULATION: pass only `task` to run N agents ({roles}) on the "
+                "SAME task and synthesise their takes — good for analysis/decisions, "
+                "not for parallel edits.\n"
+                "Do NOT put interdependent edits to the same file in separate "
+                "subtasks — they will conflict."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "task": {
                         "type": "string",
-                        "description": "A clear, self-contained description of the subtask.",
+                        "description": "The overall goal (triangulation: the task all "
+                        "agents work; divide mode: a short description of the goal).",
+                    },
+                    "subtasks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "DIVIDE-AND-CONQUER: list of independent subtasks "
+                        "run in parallel (different files/areas). Omit for triangulation.",
                     },
                     "n": {
                         "type": "integer",
-                        "description": "Number of parallel specialists (default 3, max "
-                        "capped by DEVBOT_MAX_PARALLEL env var which defaults to 8).",
+                        "description": "Triangulation only: number of parallel agents "
+                        "(default 3, capped by DEVBOT_MAX_PARALLEL, default 8).",
                     },
                     "role": {
                         "type": "string",
                         "enum": list(SPECIALISTS),
-                        "description": "If set, launch N copies of this single role "
-                        "instead of cycling through the default trio.",
+                        "description": "Role for the agents (divide mode: all subtasks; "
+                        "triangulation: N copies of this role instead of the trio).",
                     },
                 },
                 "required": ["task"],
@@ -467,24 +508,40 @@ def megadelegate_schema() -> dict:
 
 
 def run_megaswarm(manager: "Agent", task: str, n: int = 3,
-                  role: str | None = None) -> str:
-    """Run N specialists in parallel, then hand outputs to a reviewer for synthesis.
+                  role: str | None = None,
+                  subtasks: list | None = None) -> str:
+    """Run specialists in parallel, then hand outputs to a reviewer.
 
-    If *role* is given, launch N copies of that role.  Otherwise cycle through
-    the default trio (``MEGASWARM_TRIO``) for N positions.
+    Two modes:
+
+    * **Divide-and-conquer** (``subtasks`` given): each subtask is a *distinct*
+      unit of work run concurrently by its own agent (role = *role* or "coder").
+      The reviewer integrates the pieces. Use for independent work touching
+      different files — real throughput parallelism.
+    * **Triangulation** (no ``subtasks``): launch N agents on the *same* task
+      and the reviewer synthesises their independent takes.
     """
     from .agent import Agent, TOOL_SCHEMAS  # local import avoids circular dependency
 
-    # ---- Guard n ----------------------------------------------------------
-    n = max(1, int(n))
-
-    # ---- Resolve the list of roles to launch -------------------------------
-    if role is not None:
-        if role not in SPECIALISTS:
-            return f"Error: unknown specialist '{role}'. Choose one of: {', '.join(SPECIALISTS)}"
-        role_list = [role] * n
+    divide = subtasks is not None
+    if divide:
+        task_list = [str(s) for s in subtasks if str(s).strip()]
+        if not task_list:
+            return "Error: subtasks list was empty."
+        chosen = role if role in SPECIALISTS else "coder"
+        role_list = [chosen] * len(task_list)
+        n = len(task_list)
     else:
-        role_list = [MEGASWARM_TRIO[i % len(MEGASWARM_TRIO)] for i in range(n)]
+        # ---- Guard n ------------------------------------------------------
+        n = max(1, int(n))
+        # ---- Resolve the list of roles to launch --------------------------
+        if role is not None:
+            if role not in SPECIALISTS:
+                return f"Error: unknown specialist '{role}'. Choose one of: {', '.join(SPECIALISTS)}"
+            role_list = [role] * n
+        else:
+            role_list = [MEGASWARM_TRIO[i % len(MEGASWARM_TRIO)] for i in range(n)]
+        task_list = [task] * n
 
     # ---- Pre-compute unique display labels ----------------------------------
     # So the dashboard can show "coder", "coder-2", "coder-3", … from the start.
@@ -511,9 +568,10 @@ def run_megaswarm(manager: "Agent", task: str, n: int = 3,
     if sys.stdout.isatty():
         monitor = ParallelMonitor(labels)
 
+    mode_desc = "divide" if divide else "triangulate"
     label_desc = f"role={role}," if role else ""
-    print(f"\n\x1b[35;1m╔═ MEGASWARM [n={n}, {label_desc} workers={max_workers}]\x1b[0m "
-          f"\x1b[90m{task[:100]}\x1b[0m")
+    print(f"\n\x1b[35;1m╔═ MEGASWARM [{mode_desc}, n={n}, {label_desc} "
+          f"workers={max_workers}]\x1b[0m \x1b[90m{task[:100]}\x1b[0m")
 
     if monitor is not None:
         monitor.start()
@@ -522,8 +580,8 @@ def run_megaswarm(manager: "Agent", task: str, n: int = 3,
     start = time.time()
 
     def _run_one(_role: str, _sem: threading.Semaphore,
-                 _label: str) -> tuple[str, str, int]:
-        """Run a single specialist and return (role, answer, tokens)."""
+                 _label: str, _task: str) -> tuple[str, str, int]:
+        """Run a single specialist on its own task; return (role, answer, tokens)."""
         spec = SPECIALISTS[_role]
         allowed = spec["tools"]
         schemas = (TOOL_SCHEMAS if allowed is None
@@ -559,7 +617,7 @@ def run_megaswarm(manager: "Agent", task: str, n: int = 3,
             sub.confirm = lambda name, args: False
         try:
             _sem.acquire()
-            answer = sub.run(task)
+            answer = sub.run(_task)
             if monitor is not None:
                 monitor.update(_label, phase='done', tokens=sub.total_tokens)
         except Exception as exc:
@@ -575,8 +633,8 @@ def run_megaswarm(manager: "Agent", task: str, n: int = 3,
     budget_msg = ""  # deferred budget-exhausted message (printed after dashboard)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures: dict[concurrent.futures.Future, str] = {}
-        for r, lbl in zip(role_list, labels):
-            futures[pool.submit(_run_one, r, sem, lbl)] = lbl
+        for r, lbl, tk in zip(role_list, labels, task_list):
+            futures[pool.submit(_run_one, r, sem, lbl, tk)] = lbl
 
         for fut in concurrent.futures.as_completed(futures):
             try:
@@ -630,14 +688,27 @@ def run_megaswarm(manager: "Agent", task: str, n: int = 3,
         return ("(megaswarm: no agents ran — token budget already exhausted "
                 "before any agent could start)")
 
-    # ---- Phase 2: reviewer synthesises the outputs -------------------------
-    review_task = (
-        "Synthesise the following specialist outputs into ONE combined answer "
-        "for the manager.\n\n"
-        f"=== ORIGINAL TASK ===\n{task}\n\n"
-        + "\n\n".join(f"=== {k.upper()} OUTPUT ===\n{txt}"
-                      for k, txt in results.items())
-    )
+    # ---- Phase 2: reviewer integrates / synthesises the outputs -----------
+    label_to_task = dict(zip(labels, task_list))
+    if divide:
+        review_task = (
+            "Multiple agents each completed a DISTINCT subtask of one larger goal. "
+            "Integrate their results into ONE coherent report for the manager: "
+            "confirm each subtask was done, flag conflicts or gaps between them, "
+            "and note any follow-up needed.\n\n"
+            f"=== OVERALL GOAL ===\n{task}\n\n"
+            + "\n\n".join(
+                f"=== {k.upper()} (subtask: {label_to_task.get(k, '?')[:120]}) ===\n{txt}"
+                for k, txt in results.items())
+        )
+    else:
+        review_task = (
+            "Synthesise the following specialist outputs (all worked the SAME task) "
+            "into ONE combined answer for the manager.\n\n"
+            f"=== ORIGINAL TASK ===\n{task}\n\n"
+            + "\n\n".join(f"=== {k.upper()} OUTPUT ===\n{txt}"
+                          for k, txt in results.items())
+        )
 
     reviewer_spec = SPECIALISTS["reviewer"]
     allowed = reviewer_spec["tools"]
@@ -665,3 +736,90 @@ def run_megaswarm(manager: "Agent", task: str, n: int = 3,
     print(f"\x1b[35;1m╚═ MEGASWARM complete in {total_elapsed:.1f}s\x1b[0m")
 
     return synthesis or "(megaswarm reviewer returned no text)"
+
+
+# ---------------------------------------------------------------------------
+#  Pipeline — implement → review → fix (sequential), so bugs get caught
+# ---------------------------------------------------------------------------
+
+PIPELINE_REVIEWER_PROMPT = (
+    "You are a strict code REVIEWER auditing a change a coder just made. You have "
+    "read-only tools — inspect the actual files. Look for real bugs: logic errors, "
+    "broken edge cases, security holes, things that won't run, and mismatches with "
+    "the stated task.\n\n"
+    "Respond in this exact format:\n"
+    "VERDICT: CLEAN   (if the change is correct and complete)\n"
+    "or\n"
+    "VERDICT: ISSUES\n"
+    "1. <file:line> <concrete problem and the fix>\n"
+    "2. ...\n\n"
+    "Only list issues you are confident are real. Do not nitpick style."
+)
+
+_PIPELINE_MAX_FIX_ROUNDS = int(os.environ.get("DEVBOT_PIPELINE_ROUNDS", "2"))
+
+
+def pipeline_schema() -> dict:
+    """The `pipeline` tool: implement a task, then auto review-and-fix it."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "pipeline",
+            "description": (
+                "Implement a coding task with an automatic review→fix loop: a coder "
+                "makes the change, a reviewer audits the actual files for real bugs, "
+                "and the coder fixes any findings (repeating until clean or the round "
+                "limit). Prefer this over a plain `delegate(coder, ...)` for anything "
+                "that must be correct — it catches bugs before they ship."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "A clear, self-contained coding task to implement.",
+                    },
+                },
+                "required": ["task"],
+            },
+        },
+    }
+
+
+def run_pipeline(manager: "Agent", task: str) -> str:
+    """Coder implements → reviewer audits → coder fixes, looping until clean."""
+    print(f"\n\x1b[36;1m╔═ PIPELINE\x1b[0m \x1b[90m{task[:100]}\x1b[0m")
+
+    transcript = [f"## Task\n{task}"]
+    build = run_specialist(manager, "coder", task)
+    transcript.append(f"## Initial implementation\n{build}")
+
+    for round_no in range(1, _PIPELINE_MAX_FIX_ROUNDS + 1):
+        review_task = (
+            f"A coder was asked to do this task:\n{task}\n\n"
+            f"Their summary of what they changed:\n{build}\n\n"
+            "Inspect the actual files and audit the change now."
+        )
+        review = run_specialist_with_prompt(
+            manager, "reviewer", PIPELINE_REVIEWER_PROMPT, review_task,
+            label=f"reviewer-{round_no}")
+        transcript.append(f"## Review (round {round_no})\n{review}")
+
+        if "VERDICT: CLEAN" in review.upper() or "VERDICT: ISSUES" not in review.upper():
+            print(f"\x1b[36m  ╟─ review round {round_no}: clean\x1b[0m")
+            break
+
+        print(f"\x1b[36m  ╟─ review round {round_no}: issues found — fixing\x1b[0m")
+        fix_task = (
+            f"A reviewer audited your change for this task:\n{task}\n\n"
+            f"Fix every issue they raised:\n{review}\n\n"
+            "Make the edits and briefly summarise what you changed."
+        )
+        build = run_specialist(manager, "coder", fix_task)
+        transcript.append(f"## Fixes (round {round_no})\n{build}")
+    else:
+        print(f"\x1b[33m  ╟─ pipeline hit round limit "
+              f"({_PIPELINE_MAX_FIX_ROUNDS}); some issues may remain\x1b[0m")
+
+    print(f"\x1b[36;1m╚═ PIPELINE complete\x1b[0m")
+    return "\n\n".join(transcript)

@@ -15,7 +15,7 @@ _CONFIRM_LOCK = threading.Lock()
 
 from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError, InternalServerError
 
-from .tools import TOOL_SCHEMAS, DANGEROUS_TOOLS, dispatch
+from .tools import TOOL_SCHEMAS, DANGEROUS_TOOLS, ALLOW_LIST, dispatch, check_command
 
 # Transient errors worth retrying with backoff (vs. 4xx auth/balance errors).
 RETRYABLE = (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)
@@ -72,6 +72,20 @@ specialist sub-agent (coder, reviewer, tester, researcher) and returns its resul
 - Use `reviewer`/`researcher` for read-only analysis, `coder` for edits, `tester` for tests.
 - Do simple things yourself; delegate when a task benefits from focus or specialization.
 - Synthesize specialists' results into a clear final answer for the user.
+
+You also have `pipeline(task)`: a coder implements the task, a reviewer audits the
+actual files for real bugs, and the coder fixes any findings (looping until clean).
+
+HARD RULE — code changes MUST go through review:
+- For ANY task that creates, edits, or deletes files, you MUST use `pipeline(task)`.
+- Do NOT call `write_file`, `edit_file`, or mutating `run_command`s yourself, and do
+  NOT use a bare `delegate("coder", ...)` to make changes — those skip review and
+  ship bugs. `pipeline` is the only sanctioned way to modify code.
+- Your own `read_file`/`grep`/`find_files`/`list_dir` are fine for understanding the
+  task and for splitting it into pipeline calls.
+- For a large change, break it into a sequence of `pipeline(task)` calls (one per
+  coherent unit); each gets its own review→fix loop.
+- Only `delegate`/`megadelegate` for READ-ONLY work (analysis, research, review).
 """
 
 MEGASWARM_ADDENDUM = """\
@@ -83,8 +97,20 @@ the normal `delegate(role, task)` tool, you also have `megadelegate(task, n=5, r
 - If `role` is given, all N specialists share that role; otherwise the default trio
   (coder, researcher, tester) is cycled for N positions.
 - A reviewer then combines their independent outputs into one synthesis.
-- Use `megadelegate` for complex, high-stakes tasks where triangulation helps.
-- Use plain `delegate` for simpler, single-specialist needs.
+
+The HARD RULE above still applies: code changes go through `pipeline`. Use the
+megaswarm tools as follows:
+
+- `pipeline(task)` — the default for ANY code change (review→fix enforced). For a
+  big change, issue several `pipeline` calls in sequence.
+- `megadelegate(task)` (no subtasks) — TRIANGULATED ANALYSIS of one question
+  (read-only); the agents investigate and a reviewer synthesises. Never for edits.
+- `megadelegate(task, subtasks=[...])` — only when you have MANY genuinely
+  INDEPENDENT units touching DIFFERENT files and want them built concurrently.
+  Its agents edit in parallel with a single integrating reviewer (NOT a per-unit
+  fix loop), so it trades some review depth for speed — after it finishes, run a
+  `pipeline` pass over anything correctness-critical. Never put interdependent
+  same-file edits in separate subtasks (they conflict).
 """
 
 
@@ -119,12 +145,15 @@ class Agent:
         self.last_prompt_tokens = 0    # prompt size of the most recent call
         self.delegation_count = 0      # number of specialist delegations (swarm)
         self._compressed = False       # suppress repeated context-warning spam
+        self.session_id: str | None = None  # set by session.save_session on first save
         self.show_reasoning = os.environ.get("DEVBOT_SHOW_REASONING", "").lower() in ("1", "true", "yes")
+        self.allow_shell = os.environ.get("DEVBOT_ALLOW_SHELL", "").lower() in ("1", "true")
 
         self.tool_schemas = list(tool_schemas) if tool_schemas is not None else list(TOOL_SCHEMAS)
-        if swarm or megaswarm:  # the manager gets the delegate tool
-            from .swarm import delegate_schema
+        if swarm or megaswarm:  # the manager gets the delegate + pipeline tools
+            from .swarm import delegate_schema, pipeline_schema
             self.tool_schemas.append(delegate_schema())
+            self.tool_schemas.append(pipeline_schema())
         if megaswarm:
             from .swarm import megadelegate_schema
             self.tool_schemas.append(megadelegate_schema())
@@ -189,10 +218,12 @@ class Agent:
         n = len(result.splitlines())
         self._safe_print(f"\x1b[90m  = {first[:120]}{f' (+{n - 1} lines)' if n > 1 else ''}\x1b[0m")
 
-    def confirm(self, name: str, args: dict) -> bool:
+    def confirm(self, name: str, args: dict, reason: str = "") -> bool:
         if self.auto_approve:
             return True
         detail = args.get("command") or args.get("path", "")
+        if reason:
+            detail += f" — {reason}"
         tag = f"[{self.label}] " if self.label else ""
         with _CONFIRM_LOCK:  # one prompt at a time, even across parallel sub-agents
             ans = input(f"\x1b[33m  {tag}Allow {name}({detail})? [y/N/a(lways)]\x1b[0m ").strip().lower()
@@ -202,6 +233,12 @@ class Agent:
         return ans == "y"
 
     # ---- core loop ----------------------------------------------------------
+    def _auto_save(self):
+        """Persist the current session (main agent only)."""
+        if self.label is None:
+            from .session import save_session
+            save_session(self)
+
     def run(self, user_input: str) -> str:
         """Run the agentic loop until the model stops calling tools.
 
@@ -218,6 +255,7 @@ class Agent:
             self.messages.append(msg)
 
             if not tool_calls:
+                self._auto_save()
                 return text or ""  # model is done; final answer already streamed
 
             # Remember where the assistant message was so we can roll back on Ctrl+C.
@@ -248,7 +286,28 @@ class Agent:
                         from .swarm import run_megaswarm
                         result = run_megaswarm(self, args.get("task", ""),
                                                n=int(args.get("n", 3)),
-                                               role=args.get("role"))
+                                               role=args.get("role"),
+                                               subtasks=args.get("subtasks"))
+                    elif name == "pipeline":
+                        self.on_tool_start(name, args)
+                        from .swarm import run_pipeline
+                        result = run_pipeline(self, args.get("task", ""))
+                    elif name == "run_command":
+                        status, reason = check_command(args.get("command", ""))
+                        if status == "blocked":
+                            result = f"Error: command blocked — {reason}"
+                        elif status == "allowed":
+                            self.on_tool_start(name, args)
+                            result = dispatch(name, args, self.root)
+                        else:  # needs_approval
+                            if self.allow_shell and self.auto_approve:
+                                self.on_tool_start(name, args)
+                                result = dispatch(name, args, self.root)
+                            elif not self.confirm(name, args, reason=reason):
+                                result = "User declined this tool call. Ask them how to proceed."
+                            else:
+                                self.on_tool_start(name, args)
+                                result = dispatch(name, args, self.root)
                     elif name in DANGEROUS_TOOLS and not self.confirm(name, args):
                         result = "User declined this tool call. Ask them how to proceed."
                     else:
@@ -270,9 +329,11 @@ class Agent:
                 # so the conversation state stays consistent (no orphaned
                 # assistant messages with unresolved tool_calls).
                 del self.messages[assistant_idx:]
+                self._auto_save()
                 raise
 
         print("\n[devbot] Reached max tool iterations for this message.")
+        self._auto_save()
         return ""
 
     def _create_stream(self):

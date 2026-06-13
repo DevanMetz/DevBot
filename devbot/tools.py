@@ -1,5 +1,6 @@
 """Tool implementations and JSON schemas exposed to the model."""
 
+import locale
 import os
 import py_compile
 import re
@@ -29,9 +30,71 @@ BLOCKED_PATTERNS = [
     r"\.\./\.\.",
 ]
 
+# Allow-list of safe/read-only command patterns for run_command.
+ALLOW_LIST = [
+    # ---- Git read-only ----
+    r"^git\s+status(\s|$)",
+    r"^git\s+diff(\s|$)",
+    r"^git\s+log(\s|$)",
+    r"^git\s+branch(\s|$)",
+    r"^git\s+show(\s|$)",
+    r"^git\s+stash\s+list(\s|$)",
+    r"^git\s+remote\s+-v(\s|$)",
+    # ---- Directory listing ----
+    r"^(ls|dir|tree)(\s|$)",
+    # ---- Python ----
+    r"^pytest(\s|$)",
+    r"^python3?\s",
+    r"^pip\s+(list|freeze|show)(\s|$)",
+    # ---- Node ----
+    r"^npm\s+(test|run)(\s|$)",
+    r"^npx(\s|$)",
+    # ---- Cargo (fmt requires --check) ----
+    r"^cargo\s+(test|check|build|clippy)(\s|$)",
+    r"^cargo\s+fmt\s+.*--check",
+    # ---- Go ----
+    r"^go\s+(test|build|vet|fmt)(\s|$)",
+    # ---- Basic read-only ----
+    r"^(echo|cat|type|head|tail)(\s|$)",
+    # ---- Other safe utilities ----
+    r"^make\s+(test|check)(\s|$)",
+    r"^(which|where)(\s|$)",
+]
+
+
+# Shell operators that allow chaining, redirection, or substitution. An
+# allow-listed prefix containing any of these can't be trusted under shell=True.
+_SHELL_META = re.compile(r"[;&|`><\n]|\$\(")
+
 
 class PathError(Exception):
     """Raised when a path resolves outside the sandboxed project root."""
+
+
+def check_command(command: str) -> tuple:
+    """Check a command against blocked and allow-list patterns.
+
+    Returns a tuple ``(status: str, reason: str)`` where *status* is one of:
+
+    * ``"blocked"`` – matches a dangerous (deny-list) pattern
+    * ``"allowed"`` – matches a safe (allow-list) pattern
+    * ``"needs_approval"`` – matches neither list
+    """
+    for pattern in BLOCKED_PATTERNS:
+        if re.search(pattern, command):
+            return ("blocked", f"matches dangerous pattern '{pattern}'")
+    for pattern in ALLOW_LIST:
+        if re.search(pattern, command):
+            # The allow-list only validates the command *prefix*. Under
+            # shell=True, operators like ; & | $() `` > < let an allow-listed
+            # prefix chain into arbitrary commands (e.g. "git status && rm ...").
+            # If any shell metacharacter is present, fall through to approval.
+            if _SHELL_META.search(command):
+                return ("needs_approval",
+                        "allow-listed command contains shell metacharacters "
+                        "(chaining/redirection) — requires approval")
+            return ("allowed", f"matches allow-list pattern '{pattern}'")
+    return ("needs_approval", "not on allow-list")
 
 
 def _clip(text: str) -> str:
@@ -161,13 +224,15 @@ def find_files(glob: str, root: Path, path: str = ".") -> str:
 
 def run_command(command: str, root: Path, timeout: int = 120) -> str:
     # Shell injection hardening: block dangerous patterns.
-    for pattern in BLOCKED_PATTERNS:
-        if re.search(pattern, command):
-            return f"Error: command blocked — matches dangerous pattern '{pattern}'"
+    status, reason = check_command(command)
+    if status == "blocked":
+        return f"Error: command blocked — {reason}"
+    # Detect the system encoding with a utf-8 fallback (fixes Windows output).
+    enc = sys.stdout.encoding or locale.getpreferredencoding() or "utf-8"
     try:
         result = subprocess.run(
             command, shell=True, cwd=root, capture_output=True,
-            text=True, timeout=timeout, encoding="utf-8", errors="replace",
+            text=True, timeout=timeout, encoding=enc, errors="replace",
         )
     except subprocess.TimeoutExpired:
         return f"Error: command timed out after {timeout}s"
