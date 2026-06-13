@@ -9,13 +9,15 @@ task is done.
 ## Features
 
 - **Streaming agentic loop** with OpenAI-compatible function calling against DeepSeek.
-- **Six built-in tools** for reading, searching, editing, and running code.
-- **Approval gates** — writes and shell commands require confirmation (`y` / `a`lways / decline).
+- **Nine built-in tools** for reading, searching, editing, running, web-searching, and testing code.
+- **Approval gates** — writes, shell commands, and test runs require confirmation (`y` / `a`lways / decline).
 - **Sandboxed file access** — tools cannot read or write outside the project root.
-- **Reasoning support** — `deepseek-reasoner` chain-of-thought is streamed dimmed.
+- **Swarm mode** — a manager agent can delegate subtasks to specialist sub-agents.
+- **Web search** — `web_search` finds docs and examples via DuckDuckGo.
+- **Reasoning support** — thinking-mode chain-of-thought is streamed dimmed.
 - **Resilient** — transient API errors are retried with exponential backoff; auth/balance
   errors give clear, actionable messages.
-- **Token tracking** with a context-window warning, plus REPL history and `.env` support.
+- **Token tracking** with a context-window warning and auto-compression, plus REPL history and `.env` support.
 
 ## Tools available to the model
 
@@ -25,15 +27,19 @@ task is done.
 | `list_dir` | List a directory | no |
 | `grep` | Regex search across the project | no |
 | `find_files` | Find files by name glob (e.g. `*.py`) | no |
+| `web_search` | Web search via DuckDuckGo (titles, URLs, snippets) | no |
 | `write_file` | Create/overwrite a file | yes |
 | `edit_file` | Exact string replacement in a file | yes |
 | `run_command` | Shell command in the project root | yes |
+| `verify` | Auto-detect & run the project's test suite | yes |
 
 ## Setup
 
 ```sh
 pip install -e .
 ```
+
+This installs the `openai` SDK and `ddgs` (DuckDuckGo search, used by `web_search`).
 
 Get an API key at https://platform.deepseek.com, then:
 
@@ -48,7 +54,7 @@ $env:DEEPSEEK_API_KEY = "sk-..."   # PowerShell
 devbot                       # interactive REPL in the current directory
 devbot "fix the failing test"  # one-shot mode
 devbot -y                    # auto-approve all tool calls (be careful)
-devbot -m deepseek-reasoner  # use the reasoning model for harder tasks
+devbot -m deepseek-v4-pro    # use the more capable model for harder tasks
 devbot -C path/to/project    # operate on another directory
 ```
 
@@ -57,17 +63,42 @@ In the REPL:
 - `/help` — list commands
 - `/clear` — reset the conversation (keeps system prompt)
 - `/stats` — show token usage (last prompt + session total) and message count
-- `/model <name>` — switch model (`deepseek-chat` or `deepseek-reasoner`; warns on unknown names)
+- `/model <name>` — switch model (`deepseek-v4-flash` or `deepseek-v4-pro`; warns on unknown names)
 - `/auto` — toggle auto-approve
+- `/swarm` — toggle swarm mode (resets the conversation)
 - `/exit` — quit
 
-DevBot tracks token usage per call and warns when a prompt approaches the 64K
-context limit (use `/clear` to reset). Set `DEVBOT_MAX_TURNS` to cap tool
-iterations per message (default 40).
+DevBot tracks token usage per call and warns (and auto-compresses) when a prompt
+approaches the 1M context limit. Set `DEVBOT_MAX_TURNS` to cap tool iterations
+per message (default 40).
 
 When the model wants to write a file or run a command you'll get a prompt:
 `y` allows once, `a` allows everything for the rest of the session, anything
 else declines (the model is told and can adjust).
+
+## Swarm mode
+
+Run with `--swarm` (or `-s`, or toggle with `/swarm` in the REPL) to make the
+agent a **manager** that can delegate subtasks to specialist sub-agents:
+
+```sh
+devbot --swarm "add a config loader with tests and review it"
+```
+
+The manager gets a `delegate(role, task)` tool. Each call spawns a fresh sub-agent
+with its own system prompt, restricted tool set, and agentic loop; its final answer
+is returned to the manager, which synthesizes the results.
+
+| Specialist | Tools | Purpose |
+|---|---|---|
+| `coder` | all tools | write, edit, refactor code |
+| `reviewer` | read-only (incl. `web_search`) | find bugs, edge cases, style issues |
+| `tester` | read + `run_command` + `verify` | run tests, diagnose failures |
+| `researcher` | read-only (incl. `web_search`) | explore the codebase, answer questions |
+
+Sub-agents never get the `delegate` tool themselves (no recursion) and still
+respect approval gates. Specialist definitions live in
+[`devbot/swarm.py`](devbot/swarm.py).
 
 ## Configuration
 
@@ -79,9 +110,9 @@ You can also put these in a `.env` file in your project root instead of exportin
 
 ```
 DEEPSEEK_API_KEY=sk-...
-DEVBOT_MODEL=deepseek-chat
+DEVBOT_MODEL=deepseek-v4-flash
 ```
 
 Real environment variables take precedence over `.env`. Add `.env` to your `.gitignore`.
 
-Using `-m deepseek-reasoner` streams the model's chain-of-thought (dimmed) before its answer.
+In thinking mode the model's chain-of-thought is streamed (dimmed) before its answer.

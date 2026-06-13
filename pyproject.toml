@@ -9,7 +9,7 @@ description = "A Claude Code-style CLI coding agent powered by the DeepSeek API"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
-dependencies = ["openai>=1.40"]
+dependencies = ["openai>=1.40", "ddgs>=9.0"]
 
 [project.scripts]
 devbot = "devbot.cli:main"

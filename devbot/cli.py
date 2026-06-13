@@ -45,8 +45,9 @@ Commands:
   /help          show this help
   /clear         reset the conversation (keeps system prompt)
   /stats         show token usage and message count
-  /model <name>  switch model (deepseek-chat, deepseek-reasoner)
+  /model <name>  switch model (deepseek-v4-flash, deepseek-v4-pro)
   /auto          toggle auto-approve of tool calls
+  /swarm         toggle swarm mode (delegate to specialists; resets conversation)
   /exit          quit"""
 
 BANNER = """\x1b[1m
@@ -55,7 +56,7 @@ BANNER = """\x1b[1m
  | | | |/ _ \\ \\ / /  _ \\ / _ \\| __|
  | |_| |  __/\\ V /| |_) | (_) | |_
  |____/ \\___| \\_/ |____/ \\___/ \\__|  v{version}
-\x1b[0m  DeepSeek-powered coding agent · model: {model} · cwd: {cwd}
+\x1b[0m  DeepSeek-powered coding agent · model: {model}{swarm} · cwd: {cwd}
   Type /help for commands.
 """
 
@@ -66,17 +67,20 @@ def main():
     parser.add_argument("-m", "--model", default=None, help=f"Model id (default: {DEFAULT_MODEL})")
     parser.add_argument("-y", "--yes", action="store_true", help="Auto-approve all tool calls")
     parser.add_argument("-C", "--cwd", default=".", help="Project root to operate in")
+    parser.add_argument("-s", "--swarm", action="store_true",
+                        help="Swarm mode: manager agent can delegate to specialist sub-agents")
     parser.add_argument("--version", action="version", version=f"devbot {__version__}")
     args = parser.parse_args()
 
     root = Path(args.cwd).resolve()
-    agent = Agent(root=root, model=args.model, auto_approve=args.yes)
+    agent = Agent(root=root, model=args.model, auto_approve=args.yes, swarm=args.swarm)
 
     if args.prompt:  # one-shot mode: devbot "fix the failing test"
         agent.run(" ".join(args.prompt))
         return
 
-    print(BANNER.format(version=__version__, model=agent.model, cwd=root))
+    print(BANNER.format(version=__version__, model=agent.model,
+                        swarm=" · swarm" if agent.swarm else "", cwd=root))
     while True:
         try:
             user = input("\x1b[1m\x1b[32m> \x1b[0m").strip()
@@ -98,7 +102,9 @@ def main():
             print(f"[model: {agent.model} | last prompt: {agent.last_prompt_tokens:,} tokens "
                   f"| session total: {agent.total_tokens:,} tokens "
                   f"| messages: {len(agent.messages)} | max turns: {agent.max_turns} "
-                  f"| auto-approve: {'on' if agent.auto_approve else 'off'}]")
+                  f"| auto-approve: {'on' if agent.auto_approve else 'off'} "
+                  f"| swarm: {'on' if agent.swarm else 'off'}"
+                  f"{f' | delegations: {agent.delegation_count}' if agent.swarm else ''}]")
             continue
         if user.startswith("/model"):
             parts = user.split(maxsplit=1)
@@ -112,6 +118,13 @@ def main():
         if user == "/auto":
             agent.auto_approve = not agent.auto_approve
             print(f"[auto-approve: {'on' if agent.auto_approve else 'off'}]")
+            continue
+        if user == "/swarm":
+            # Recreate the agent with swarm toggled; this resets the conversation
+            # because the system prompt and tool set change.
+            agent = Agent(root=root, model=agent.model, auto_approve=agent.auto_approve,
+                          swarm=not agent.swarm)
+            print(f"[swarm mode: {'on' if agent.swarm else 'off'} — conversation reset]")
             continue
         try:
             agent.run(user)

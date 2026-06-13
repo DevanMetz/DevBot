@@ -3,6 +3,7 @@
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 MAX_OUTPUT = 50_000  # chars returned to the model per tool call
@@ -31,7 +32,8 @@ def _resolve(path: str, root: Path) -> Path:
     root = root.resolve()
     p = Path(path)
     p = (root / p).resolve() if not p.is_absolute() else p.resolve()
-    if p != root and root not in p.parents:
+    # Allow access to root itself and anything inside it
+    if p != root and not p.is_relative_to(root):
         raise PathError(
             f"Path '{path}' is outside the project root ({root}). "
             "Access is restricted to the project directory."
@@ -149,6 +151,174 @@ def run_command(command: str, root: Path, timeout: int = 120) -> str:
     return _clip(out.strip())
 
 
+def web_search(query: str, max_results: int = 5) -> str:
+    """Search the web using DuckDuckGo and return structured results.
+
+    Requires the `ddgs` package (>=9.0). Falls back to the DuckDuckGo
+    Instant Answer API if the package is not installed, though that only
+    provides encyclopedic summaries, not full web results.
+    """
+    max_results = min(max(max_results, 1), 10)
+
+    fallback = False
+    try:
+        from ddgs import DDGS
+
+        results = list(DDGS().text(query, max_results=max_results))
+    except ImportError:
+        fallback = True
+    except Exception as e:
+        return f"Error: web search via ddgs failed — {e}"
+
+    if fallback:
+        # Fallback to the free Instant Answer API (no API key needed).
+        import json
+        import urllib.request
+        import urllib.parse
+
+        url = "https://api.duckduckgo.com/?" + urllib.parse.urlencode({
+            "q": query, "format": "json", "no_html": "1", "skip_disambig": "1",
+        })
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read())
+        except Exception as e:
+            return f"Error: web search failed — {e}"
+
+        lines = []
+        abstract = (data.get("AbstractText") or "").strip()
+        if abstract:
+            source = data.get("AbstractURL") or ""
+            heading = data.get("Heading") or "Result"
+            lines.append(f"[{heading}]")
+            lines.append(f"   {abstract}")
+            if source:
+                lines.append(f"   URL: {source}")
+        else:
+            lines.append("(no instant answer found for this query)")
+
+        related = data.get("RelatedTopics") or []
+        for i, topic in enumerate(related[:max_results]):
+            text = (topic.get("Text") or "").strip()
+            url = topic.get("FirstURL") or ""
+            if text:
+                lines.append(f"\n{i + 1}. {text}")
+                if url:
+                    lines.append(f"   URL: {url}")
+        return _clip("\n".join(lines))
+
+    if not results:
+        return "(no web results found for this query)"
+
+    lines = []
+    for i, r in enumerate(results, 1):
+        title = r.get("title", "(no title)")
+        href = r.get("href", "")
+        body = r.get("body", "")
+        lines.append(f"{i}. {title}")
+        if href:
+            lines.append(f"   URL: {href}")
+        if body:
+            lines.append(f"   {body}")
+        lines.append("")
+    return _clip("\n".join(lines))
+
+
+def verify(root: Path) -> str:
+    """Auto-detect the project's test framework, run tests, and report results.
+
+    Checks for common test runners (pytest, tox, npm test, cargo test, go test,
+    make test) and runs the first one that looks viable. Falls back to a manual
+    check of recently modified Python files for syntax errors.
+    """
+    # Ordered list of (condition, command, label) triples
+    candidates: list[tuple] = [
+        # Python
+        ((root / "pyproject.toml").is_file() or (root / "setup.py").is_file()
+         or (root / "setup.cfg").is_file(),
+         ["pytest", "-x", "--tb=short", "-q"], "pytest"),
+
+        ((root / "tox.ini").is_file(), ["tox", "-q"], "tox"),
+
+        # Node/JS
+        ((root / "package.json").is_file(),
+         ["npm", "test", "--", "--silent"], "npm test"),
+
+        # Rust
+        ((root / "Cargo.toml").is_file(), ["cargo", "test", "-q"], "cargo test"),
+
+        # Go
+        ((root / "go.mod").is_file(), ["go", "test", "./..."], "go test"),
+
+        # Make
+        ((root / "Makefile").is_file(), ["make", "test"], "make test"),
+    ]
+
+    for condition, cmd, label in candidates:
+
+        if not condition:
+            continue
+
+        try:
+            result = subprocess.run(
+                cmd, cwd=root, capture_output=True,
+                text=True, timeout=180, encoding="utf-8", errors="replace",
+            )
+        except subprocess.TimeoutExpired:
+            return f"WARN: {label} timed out after 180s"
+        except FileNotFoundError:
+            continue  # runner not installed, try next
+
+        out = (result.stdout or "").strip()
+        err = (result.stderr or "").strip()
+        rc = result.returncode
+
+        if rc == 5:
+            # "no tests collected" — try next candidate
+            continue
+
+        report = [f"[TEST] {label} (exit {rc})"]
+        if out:
+            report.append("\n[stdout]")
+            report.append(_clip(out))
+        if err:
+            report.append("\n[stderr]")
+            report.append(_clip(err))
+        if rc == 0:
+            report.insert(0, "PASS: All tests passed!")
+        else:
+            report.insert(0, f"FAIL: Tests failed (exit code {rc})")
+        return "\n".join(report)
+
+    # No test framework found — do a quick syntax check on Python files
+    py_files = list(root.rglob("*.py"))
+    if not py_files:
+        return "WARN: No test framework detected and no Python files to check."
+
+    errors = []
+    for fp in py_files:
+        # Skip common virtualenv / cache paths
+        parts = fp.parts
+        if any(d in SKIP_DIRS for d in parts):
+            continue
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "py_compile", str(fp)],
+                capture_output=True, text=True, timeout=10, check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            errors.append(f"  Syntax error in {fp.relative_to(root)}:\n    {(e.stderr or '').strip()}")
+        except subprocess.TimeoutExpired:
+            errors.append(f"  Timeout compiling {fp.relative_to(root)}")
+        except Exception:
+            pass
+
+    if errors:
+        return "WARN: No test framework found. Syntax check found issues:\n" + "\n".join(errors[:20])
+    checked = len(py_files) - sum(1 for fp in py_files if any(d in SKIP_DIRS for d in fp.parts))
+    return f"INFO: No test framework detected. Syntax-checked {checked} Python files -- no errors."
+
+
 # JSON schemas sent to DeepSeek (OpenAI function-calling format)
 TOOL_SCHEMAS = [
     {
@@ -256,10 +426,36 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web using DuckDuckGo and return structured results (titles, URLs, snippets). Use for finding documentation, examples, or current info.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query string."},
+                    "max_results": {"type": "integer", "description": "Maximum number of results to return (default 5, max 10).", "minimum": 1, "maximum": 10},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify",
+            "description": "Auto-detect the project's test framework (pytest, npm test, cargo test, go test, etc.), run tests, and report results. Use after making changes to verify they work.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
 ]
 
 # Tools that mutate state or execute code -> require confirmation unless auto-approved
-DANGEROUS_TOOLS = {"write_file", "edit_file", "run_command"}
+DANGEROUS_TOOLS = {"write_file", "edit_file", "run_command", "verify"}
 
 
 def dispatch(name: str, args: dict, root: Path) -> str:
@@ -280,6 +476,10 @@ def dispatch(name: str, args: dict, root: Path) -> str:
             return find_files(args["glob"], root, args.get("path", "."))
         if name == "run_command":
             return run_command(args["command"], root, args.get("timeout", 120))
+        if name == "web_search":
+            return web_search(args["query"], args.get("max_results", 5))
+        if name == "verify":
+            return verify(root)
         return f"Error: unknown tool '{name}'"
     except Exception as e:  # surface errors to the model so it can recover
         return f"Error: {type(e).__name__}: {e}"
