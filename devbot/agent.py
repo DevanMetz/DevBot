@@ -45,6 +45,16 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"  # use "deepseek-v4-pro" for harder tasks
 DEFAULT_MAX_TURNS = 200  # tool-loop cap per message; override with DEVBOT_MAX_TURNS
 
+# Per-1M-token pricing (USD), cache-miss input rates per the DeepSeek pricing
+# page. deepseek-chat / deepseek-reasoner are legacy aliases for V4-flash and
+# share its pricing. Cost estimates are approximate (cache hits cost less).
+MODEL_PRICING = {
+    "deepseek-v4-flash":  {"input": 0.14, "output": 0.28},
+    "deepseek-v4-pro":    {"input": 0.435, "output": 0.87},
+    "deepseek-chat":      {"input": 0.14, "output": 0.28},
+    "deepseek-reasoner":  {"input": 0.14, "output": 0.28},
+}
+
 SYSTEM_PROMPT = """\
 You are DevBot, a CLI coding agent working in the user's project directory: {cwd}
 Platform: {platform}
@@ -148,6 +158,8 @@ class Agent:
         self.session_id: str | None = None  # set by session.save_session on first save
         self.show_reasoning = os.environ.get("DEVBOT_SHOW_REASONING", "").lower() in ("1", "true", "yes")
         self.allow_shell = os.environ.get("DEVBOT_ALLOW_SHELL", "").lower() in ("1", "true")
+        self.token_budget = int(os.environ.get("DEVBOT_TOKEN_BUDGET", "0") or "0")
+        self._budget_exhausted = False
 
         self.tool_schemas = list(tool_schemas) if tool_schemas is not None else list(TOOL_SCHEMAS)
         if swarm or megaswarm:  # the manager gets the delegate + pipeline tools
@@ -239,6 +251,19 @@ class Agent:
             from .session import save_session
             save_session(self)
 
+    def estimated_cost(self) -> float:
+        """Estimated USD cost of the session.
+
+        Uses a 50/50 input/output split heuristic since we only track total
+        tokens (not input vs output separately). If the model isn't in the
+        pricing table, defaults to deepseek-v4-flash prices.
+        """
+        pricing = MODEL_PRICING.get(self.model, MODEL_PRICING["deepseek-v4-flash"])
+        input_price = pricing["input"] / 1_000_000
+        output_price = pricing["output"] / 1_000_000
+        half = self.total_tokens / 2
+        return half * input_price + half * output_price
+
     def run(self, user_input: str) -> str:
         """Run the agentic loop until the model stops calling tools.
 
@@ -246,8 +271,24 @@ class Agent:
         agent is a delegated specialist)."""
         self.messages.append({"role": "user", "content": user_input})
 
+        if self.token_budget > 0 and self.total_tokens >= self.token_budget:
+            self._safe_print(
+                f"[devbot] Token budget exhausted ({self.total_tokens:,} >= "
+                f"{self.token_budget:,}). Session halted."
+            )
+            self._auto_save()
+            return ""
+
         for _ in range(self.max_turns):
             text, tool_calls = self._stream_once()
+
+            if self._budget_exhausted:
+                self._safe_print(
+                    f"[devbot] Token budget exhausted ({self.total_tokens:,} >= "
+                    f"{self.token_budget:,}). Session halted."
+                )
+                self._auto_save()
+                return text or ""
 
             msg: dict = {"role": "assistant", "content": text or None}
             if tool_calls:
@@ -369,6 +410,8 @@ class Agent:
             if getattr(chunk, "usage", None):
                 self.last_prompt_tokens = chunk.usage.prompt_tokens
                 self.total_tokens += chunk.usage.total_tokens
+                if self.token_budget > 0 and self.total_tokens >= self.token_budget:
+                    self._budget_exhausted = True
                 # P1-1: context threshold check, now inside _stream_once right
                 # after the usage chunk so it fires at most once per API call.
                 if (self.last_prompt_tokens > 0.85 * CONTEXT_LIMIT
@@ -486,8 +529,9 @@ class Agent:
         ]
 
         try:
+            compress_model = os.environ.get("DEVBOT_COMPRESS_MODEL", "deepseek-v4-flash")
             resp = self.client.chat.completions.create(
-                model=self.model,
+                model=compress_model,
                 messages=compress_msgs,
                 stream=False,
                 timeout=60,

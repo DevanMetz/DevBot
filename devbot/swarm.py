@@ -555,6 +555,19 @@ def run_megaswarm(manager: "Agent", task: str, n: int = 3,
             label_counts[r] = 1
             labels.append(r)
 
+    # ---- Megadelegate warning -----------------------------------------------
+    warn_threshold = int(os.environ.get("DEVBOT_MEGA_WARN_THRESHOLD", "5"))
+    if n > warn_threshold:
+        # Pick a safe warning character, matching ParallelMonitor._choose_icons.
+        warn_icon = "\u26a0"  # ⚠
+        try:
+            warn_icon.encode(sys.stdout.encoding or "utf-8")
+        except (UnicodeEncodeError, UnicodeError, LookupError):
+            warn_icon = "!!"
+        print(f"\x1b[33m[devbot] {warn_icon} Launching {n} agents — "
+              f"this may be expensive. "
+              f"Set DEVBOT_MEGA_WARN_THRESHOLD to suppress.\x1b[0m")
+
     # ---- Concurrency cap & semaphore ---------------------------------------
     max_parallel = int(os.environ.get("DEVBOT_MAX_PARALLEL", "8"))
     max_workers = min(n, max_parallel)

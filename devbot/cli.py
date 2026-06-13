@@ -137,12 +137,17 @@ def main():
             continue
         if user == "/stats":
             mode = "megaswarm" if agent.megaswarm else ("swarm" if agent.swarm else "solo")
-            print(f"[model: {agent.model} | last prompt: {agent.last_prompt_tokens:,} tokens "
-                  f"| session total: {agent.total_tokens:,} tokens "
-                  f"| messages: {len(agent.messages)} | max turns: {agent.max_turns} "
-                  f"| auto-approve: {'on' if agent.auto_approve else 'off'} "
-                  f"| mode: {mode}"
-                  f"{f' | delegations: {agent.delegation_count}' if agent.swarm or agent.megaswarm else ''}]")
+            cost = agent.estimated_cost()
+            line = (f"[model: {agent.model} | last prompt: {agent.last_prompt_tokens:,} tokens "
+                    f"| session total: {agent.total_tokens:,} tokens "
+                    f"| messages: {len(agent.messages)} | max turns: {agent.max_turns} "
+                    f"| auto-approve: {'on' if agent.auto_approve else 'off'} "
+                    f"| mode: {mode}"
+                    f"{f' | delegations: {agent.delegation_count}' if agent.swarm or agent.megaswarm else ''}"
+                    f" | cost: ${cost:.2f}")
+            if agent.token_budget > 0:
+                line += f" | budget: {agent.token_budget:,} tokens"
+            print(line + "]")
             continue
         if user.startswith("/model"):
             parts = user.split(maxsplit=1)

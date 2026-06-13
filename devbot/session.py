@@ -68,9 +68,10 @@ def save_session(agent: "Agent") -> str | None:
         "swarm": agent.swarm,
         "megaswarm": agent.megaswarm,
         "auto_approve": agent.auto_approve,
-        "total_tokens": agent.total_tokens,
-        "last_prompt_tokens": agent.last_prompt_tokens,
-        "delegation_count": agent.delegation_count,
+        "total_tokens": getattr(agent, "total_tokens", 0),
+        "last_prompt_tokens": getattr(agent, "last_prompt_tokens", 0),
+        "delegation_count": getattr(agent, "delegation_count", 0),
+        "token_budget": getattr(agent, "token_budget", 0),
         "messages": agent.messages,
     }
 
@@ -171,6 +172,7 @@ def restore_agent(root: Path, session_id: str | None = None,
     agent.total_tokens = data.get("total_tokens", 0)
     agent.last_prompt_tokens = data.get("last_prompt_tokens", 0)
     agent.delegation_count = data.get("delegation_count", 0)
+    agent.token_budget = data.get("token_budget", 0)
     agent.session_id = data.get("id", session_id)
     agent.session_created = data.get("created", "")
     return agent

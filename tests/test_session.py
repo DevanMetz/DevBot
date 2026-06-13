@@ -204,6 +204,7 @@ class TestSaveSessionWithAgent:
         agent = Agent.__new__(Agent)
         agent.label = "coder"
         agent.root = tmp_path
+        agent.token_budget = 0
         result = save_session(agent)
         assert result is None
 
@@ -221,6 +222,7 @@ class TestSaveSessionWithAgent:
         agent.total_tokens = 12345
         agent.last_prompt_tokens = 200
         agent.delegation_count = 5
+        agent.token_budget = 0
         agent.messages = [
             {"role": "system", "content": "You are DevBot."},
             {"role": "user", "content": "test"},
@@ -258,6 +260,7 @@ class TestSaveSessionWithAgent:
         agent.total_tokens = 100
         agent.last_prompt_tokens = 50
         agent.delegation_count = 0
+        agent.token_budget = 0
         agent.messages = [{"role": "user", "content": "hi"}]
         agent.session_id = None
 
@@ -453,6 +456,7 @@ class TestAtomicWrite:
         agent.total_tokens = 0
         agent.last_prompt_tokens = 0
         agent.delegation_count = 0
+        agent.token_budget = 0
         agent.messages = []
         agent.session_id = None
 
