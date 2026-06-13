@@ -1,6 +1,7 @@
 """Tool implementations and JSON schemas exposed to the model."""
 
 import os
+import py_compile
 import re
 import subprocess
 import sys
@@ -9,7 +10,24 @@ from pathlib import Path
 MAX_OUTPUT = 50_000  # chars returned to the model per tool call
 
 # Directories skipped by recursive walks (grep, find_files) and listings.
-SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
+              ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".next",
+              "target", ".idea", ".vscode", ".egg-info", "__pypackages__",
+              ".turbo", ".nx"}
+
+# Dangerous shell patterns blocked in run_command.
+BLOCKED_PATTERNS = [
+    r"rm\s+-rf\s+/",
+    r":\(\)\s*\{\s*:\|:&\s*\};:",
+    r"chmod\s+.*777\s+/",
+    r">\s*/dev/sda",
+    r"mkfs\.",
+    r"dd\s+if=",
+    r"curl.*\|.*(sh|bash|dash|zsh|ksh)",
+    r"wget.*\|.*(sh|bash|dash|zsh|ksh)",
+    r"sudo\s",
+    r"\.\./\.\.",
+]
 
 
 class PathError(Exception):
@@ -17,7 +35,7 @@ class PathError(Exception):
 
 
 def _clip(text: str) -> str:
-    if len(text) > MAX_OUTPUT:
+    if len(text) >= MAX_OUTPUT:
         return text[:MAX_OUTPUT] + f"\n... [truncated, {len(text)} chars total]"
     return text
 
@@ -47,6 +65,9 @@ def read_file(path: str, root: Path, offset: int = 0, limit: int = 2000) -> str:
         return f"Error: {p} is not a file"
     lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     total = len(lines)
+    offset = max(0, offset)
+    if offset >= total:
+        return f"Error: offset {offset} is beyond file end ({total} lines)"
     chunk = lines[offset : offset + limit]
     numbered = "\n".join(f"{i + offset + 1}\t{line}" for i, line in enumerate(chunk))
     if not numbered:
@@ -68,6 +89,8 @@ def write_file(path: str, content: str, root: Path) -> str:
 
 def edit_file(path: str, old_string: str, new_string: str, root: Path,
               replace_all: bool = False) -> str:
+    if not old_string:
+        return "Error: old_string must not be empty."
     p = _resolve(path, root)
     if not p.is_file():
         return f"Error: {p} is not a file"
@@ -137,6 +160,10 @@ def find_files(glob: str, root: Path, path: str = ".") -> str:
 
 
 def run_command(command: str, root: Path, timeout: int = 120) -> str:
+    # Shell injection hardening: block dangerous patterns.
+    for pattern in BLOCKED_PATTERNS:
+        if re.search(pattern, command):
+            return f"Error: command blocked — matches dangerous pattern '{pattern}'"
     try:
         result = subprocess.run(
             command, shell=True, cwd=root, capture_output=True,
@@ -145,7 +172,7 @@ def run_command(command: str, root: Path, timeout: int = 120) -> str:
     except subprocess.TimeoutExpired:
         return f"Error: command timed out after {timeout}s"
     out = result.stdout or ""
-    if result.stderr:
+    if result.stderr.strip():
         out += ("\n[stderr]\n" + result.stderr)
     out += f"\n[exit code: {result.returncode}]"
     return _clip(out.strip())
@@ -274,8 +301,9 @@ def verify(root: Path) -> str:
         rc = result.returncode
 
         if rc == 5:
-            # "no tests collected" — try next candidate
-            continue
+            # "no tests collected" — report and stop trying other candidates
+            return (f"INFO: pytest ran but collected no tests (exit 5). "
+                    "Check test discovery config.")
 
         report = [f"[TEST] {label} (exit {rc})"]
         if out:
@@ -302,14 +330,9 @@ def verify(root: Path) -> str:
         if any(d in SKIP_DIRS for d in parts):
             continue
         try:
-            subprocess.run(
-                [sys.executable, "-m", "py_compile", str(fp)],
-                capture_output=True, text=True, timeout=10, check=True,
-            )
-        except subprocess.CalledProcessError as e:
-            errors.append(f"  Syntax error in {fp.relative_to(root)}:\n    {(e.stderr or '').strip()}")
-        except subprocess.TimeoutExpired:
-            errors.append(f"  Timeout compiling {fp.relative_to(root)}")
+            py_compile.compile(str(fp), doraise=True)
+        except py_compile.PyCompileError as e:
+            errors.append(f"  Syntax error in {fp.relative_to(root)}:\n    {e}")
         except Exception:
             pass
 
@@ -457,29 +480,33 @@ TOOL_SCHEMAS = [
 # Tools that mutate state or execute code -> require confirmation unless auto-approved
 DANGEROUS_TOOLS = {"write_file", "edit_file", "run_command", "verify"}
 
+# Dict-based dispatch: maps tool name -> handler(args, root).
+# Null-safe arg.get(key) or default handles JSON null coercion (P1-11).
+_TOOL_HANDLERS = {
+    "read_file": lambda a, r: read_file(
+        a["path"], r, a.get("offset") or 0, a.get("limit") or 2000),
+    "write_file": lambda a, r: write_file(a["path"], a["content"], r),
+    "edit_file": lambda a, r: edit_file(
+        a["path"], a["old_string"], a["new_string"], r, a.get("replace_all") or False),
+    "list_dir": lambda a, r: list_dir(a.get("path") or ".", r),
+    "grep": lambda a, r: grep(
+        a["pattern"], r, a.get("path") or ".", a.get("glob") or ""),
+    "find_files": lambda a, r: find_files(
+        a["glob"], r, a.get("path") or "."),
+    "run_command": lambda a, r: run_command(
+        a["command"], r, a.get("timeout") or 120),
+    "web_search": lambda a, r: web_search(
+        a["query"], a.get("max_results") or 5),
+    "verify": lambda a, r: verify(r),
+}
+
 
 def dispatch(name: str, args: dict, root: Path) -> str:
     """Execute a tool by name with parsed arguments."""
     try:
-        if name == "read_file":
-            return read_file(args["path"], root, args.get("offset", 0), args.get("limit", 2000))
-        if name == "write_file":
-            return write_file(args["path"], args["content"], root)
-        if name == "edit_file":
-            return edit_file(args["path"], args["old_string"], args["new_string"],
-                             root, args.get("replace_all", False))
-        if name == "list_dir":
-            return list_dir(args.get("path", "."), root)
-        if name == "grep":
-            return grep(args["pattern"], root, args.get("path", "."), args.get("glob", ""))
-        if name == "find_files":
-            return find_files(args["glob"], root, args.get("path", "."))
-        if name == "run_command":
-            return run_command(args["command"], root, args.get("timeout", 120))
-        if name == "web_search":
-            return web_search(args["query"], args.get("max_results", 5))
-        if name == "verify":
-            return verify(root)
-        return f"Error: unknown tool '{name}'"
+        handler = _TOOL_HANDLERS.get(name)
+        if handler is None:
+            return f"Error: unknown tool '{name}'"
+        return handler(args, root)
     except Exception as e:  # surface errors to the model so it can recover
         return f"Error: {type(e).__name__}: {e}"

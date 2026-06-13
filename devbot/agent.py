@@ -2,8 +2,15 @@
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
+
+import httpx
+
+# Serializes interactive approval prompts so parallel megaswarm sub-agents
+# can't race on stdin and corrupt each other's input.
+_CONFIRM_LOCK = threading.Lock()
 
 from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError, InternalServerError
 
@@ -35,7 +42,7 @@ def _load_dotenv(root: Path):
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"  # use "deepseek-v4-pro" for harder tasks
-DEFAULT_MAX_TURNS = 40  # tool-loop cap per message; override with DEVBOT_MAX_TURNS
+DEFAULT_MAX_TURNS = 200  # tool-loop cap per message; override with DEVBOT_MAX_TURNS
 
 SYSTEM_PROMPT = """\
 You are DevBot, a CLI coding agent working in the user's project directory: {cwd}
@@ -66,11 +73,25 @@ specialist sub-agent (coder, reviewer, tester, researcher) and returns its resul
 - Synthesize specialists' results into a clear final answer for the user.
 """
 
+MEGASWARM_ADDENDUM = """\
+
+You are running as the MANAGER of a MEGASWARM. In addition to your own tools and
+the normal `delegate(role, task)` tool, you also have `megadelegate(task, n=5, role=None)` which:
+
+- Launches N specialists (default 3) IN PARALLEL on the SAME task.
+- If `role` is given, all N specialists share that role; otherwise the default trio
+  (coder, researcher, tester) is cycled for N positions.
+- A reviewer then combines their independent outputs into one synthesis.
+- Use `megadelegate` for complex, high-stakes tasks where triangulation helps.
+- Use plain `delegate` for simpler, single-specialist needs.
+"""
+
 
 class Agent:
     def __init__(self, root: Path, model: str | None = None, auto_approve: bool = False,
                  system_prompt: str | None = None, tool_schemas: list | None = None,
-                 swarm: bool = False, label: str | None = None):
+                 swarm: bool = False, megaswarm: bool = False,
+                 label: str | None = None):
         _load_dotenv(root)
         api_key = os.environ.get("DEEPSEEK_API_KEY")
         if not api_key:
@@ -80,31 +101,57 @@ class Agent:
                 '  PowerShell:  $env:DEEPSEEK_API_KEY = "sk-..."\n'
                 "  bash/zsh:    export DEEPSEEK_API_KEY=sk-..."
             )
-        self.client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+        self.client = OpenAI(
+            api_key=api_key, base_url=DEEPSEEK_BASE_URL,
+            http_client=httpx.Client(
+                limits=httpx.Limits(max_connections=64,
+                                    max_keepalive_connections=32)),
+            timeout=httpx.Timeout(120.0, connect=10.0))
         self.model = model or os.environ.get("DEVBOT_MODEL", DEFAULT_MODEL)
         self.root = root
         self.auto_approve = auto_approve
         self.swarm = swarm
+        self.megaswarm = megaswarm
         self.label = label  # output prefix for sub-agents, e.g. "coder"
         self.max_turns = int(os.environ.get("DEVBOT_MAX_TURNS", DEFAULT_MAX_TURNS))
         self.total_tokens = 0          # cumulative across the session
         self.last_prompt_tokens = 0    # prompt size of the most recent call
         self.delegation_count = 0      # number of specialist delegations (swarm)
+        self._compressed = False       # suppress repeated context-warning spam
+        self.show_reasoning = os.environ.get("DEVBOT_SHOW_REASONING", "").lower() in ("1", "true", "yes")
 
         self.tool_schemas = list(tool_schemas) if tool_schemas is not None else list(TOOL_SCHEMAS)
-        if swarm:  # the manager gets the delegate tool on top of its normal tools
+        if swarm or megaswarm:  # the manager gets the delegate tool
             from .swarm import delegate_schema
             self.tool_schemas.append(delegate_schema())
+        if megaswarm:
+            from .swarm import megadelegate_schema
+            self.tool_schemas.append(megadelegate_schema())
 
         if system_prompt is not None:
             prompt = system_prompt
         else:
             prompt = SYSTEM_PROMPT.format(cwd=root, platform=os.name)
-            if swarm:
+            if megaswarm:
+                prompt += MANAGER_ADDENDUM + MEGASWARM_ADDENDUM
+            elif swarm:
                 prompt += MANAGER_ADDENDUM
         self.messages: list[dict] = [{"role": "system", "content": prompt}]
 
     # ---- UI hooks (overridden/used by cli.py) -------------------------------
+    @staticmethod
+    def _transient_line(text: str, clear: bool = False):
+        """Print/update a single in-place transient line (no scroll).
+
+        When *clear* is True, erase the transient line entirely.
+        When *clear* is False, write *text* on the current terminal line
+        using a carriage return + clear-to-end-of-line.
+        """
+        if clear:
+            print("\r\x1b[2K", end="", flush=True)
+        else:
+            print(f"\r{text}\x1b[K", end="", flush=True)
+
     def on_text(self, chunk: str):
         print(chunk, end="", flush=True)
 
@@ -124,7 +171,9 @@ class Agent:
         if self.auto_approve:
             return True
         detail = args.get("command") or args.get("path", "")
-        ans = input(f"\x1b[33m  Allow {name}({detail})? [y/N/a(lways)]\x1b[0m ").strip().lower()
+        tag = f"[{self.label}] " if self.label else ""
+        with _CONFIRM_LOCK:  # one prompt at a time, even across parallel sub-agents
+            ans = input(f"\x1b[33m  {tag}Allow {name}({detail})? [y/N/a(lways)]\x1b[0m ").strip().lower()
         if ans == "a":
             self.auto_approve = True
             return True
@@ -146,37 +195,60 @@ class Agent:
                 msg["tool_calls"] = tool_calls
             self.messages.append(msg)
 
-            if self.last_prompt_tokens > 0.85 * CONTEXT_LIMIT:
-                print(f"\x1b[33m[devbot] Warning: prompt is {self.last_prompt_tokens:,} "
-                      f"tokens, near the {CONTEXT_LIMIT:,} limit.\x1b[0m")
-                if self._compress_conversation():
-                    print("\x1b[90m[devbot] Conversation compressed to free context space.\x1b[0m")
-
             if not tool_calls:
                 return text or ""  # model is done; final answer already streamed
 
-            for tc in tool_calls:
-                name = tc["function"]["name"]
-                try:
-                    args = json.loads(tc["function"]["arguments"] or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-                self.on_tool_start(name, args)
+            # Remember where the assistant message was so we can roll back on Ctrl+C.
+            assistant_idx = len(self.messages) - 1
+            try:
+                for tc in tool_calls:
+                    name = tc["function"]["name"]
+                    try:
+                        args = json.loads(tc["function"]["arguments"] or "{}")
+                    except json.JSONDecodeError:
+                        raw_args = tc["function"]["arguments"]
+                        result = (f"Error: failed to parse tool arguments as JSON. "
+                                  f"Raw arguments string: {raw_args!r}")
+                        if tc["id"]:
+                            self.messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": result,
+                            })
+                        continue
 
-                if name == "delegate":
-                    from .swarm import run_specialist
-                    result = run_specialist(self, args.get("role", ""), args.get("task", ""))
-                elif name in DANGEROUS_TOOLS and not self.confirm(name, args):
-                    result = "User declined this tool call. Ask them how to proceed."
-                else:
-                    result = dispatch(name, args, self.root)
+                    if name == "delegate":
+                        self.on_tool_start(name, args)
+                        from .swarm import run_specialist
+                        result = run_specialist(self, args.get("role", ""), args.get("task", ""))
+                    elif name == "megadelegate":
+                        self.on_tool_start(name, args)
+                        from .swarm import run_megaswarm
+                        result = run_megaswarm(self, args.get("task", ""),
+                                               n=int(args.get("n", 3)),
+                                               role=args.get("role"))
+                    elif name in DANGEROUS_TOOLS and not self.confirm(name, args):
+                        result = "User declined this tool call. Ask them how to proceed."
+                    else:
+                        self.on_tool_start(name, args)
+                        result = dispatch(name, args, self.root)
 
-                self.on_tool_end(result)
-                self.messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result,
-                })
+                    self.on_tool_end(result)
+                    if not tc["id"]:
+                        print(f"\x1b[33m[devbot] Warning: tool_call_id is empty for "
+                              f"tool '{name}'; skipping tool result.\x1b[0m")
+                        continue
+                    self.messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": result,
+                    })
+            except KeyboardInterrupt:
+                # Roll back the assistant message and any partial tool results
+                # so the conversation state stays consistent (no orphaned
+                # assistant messages with unresolved tool_calls).
+                del self.messages[assistant_idx:]
+                raise
 
         print("\n[devbot] Reached max tool iterations for this message.")
         return ""
@@ -207,24 +279,52 @@ class Agent:
         text_parts: list[str] = []
         calls: dict[int, dict] = {}
         in_reasoning = False
+        finish_reason = None
 
         for chunk in stream:
             # Final chunk (include_usage) carries token counts and no choices.
             if getattr(chunk, "usage", None):
                 self.last_prompt_tokens = chunk.usage.prompt_tokens
                 self.total_tokens += chunk.usage.total_tokens
+                # P1-1: context threshold check, now inside _stream_once right
+                # after the usage chunk so it fires at most once per API call.
+                if (self.last_prompt_tokens > 0.85 * CONTEXT_LIMIT
+                        and not self._compressed):
+                    print(f"\x1b[33m[devbot] Warning: prompt is {self.last_prompt_tokens:,} "
+                          f"tokens, near the {CONTEXT_LIMIT:,} limit.\x1b[0m")
+                    self._compressed = True  # suppress until next successful compression
+                    if self._compress_conversation():
+                        print("\x1b[90m[devbot] Conversation compressed to free "
+                              "context space.\x1b[0m")
+                        self._compressed = False
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
+            # P1-7: capture finish_reason from the final choice chunk
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
             # thinking mode streams chain-of-thought in reasoning_content
             reasoning = getattr(delta, "reasoning_content", None)
             if reasoning:
-                if not in_reasoning:
+                if not in_reasoning and not self.show_reasoning:
+                    # Start of CoT: show compact thinking indicator
+                    self._reasoning_chars = 0
+                    self._transient_line("💭 thinking\u2026 (0 tokens)")
+                if self.show_reasoning and not in_reasoning:
                     self.on_text("\x1b[90m")
-                    in_reasoning = True
-                self.on_text(reasoning)
+                in_reasoning = True
+                if self.show_reasoning:
+                    self.on_text(reasoning)
+                else:
+                    self._reasoning_chars += len(reasoning)
+                    est_tokens = max(1, self._reasoning_chars // 4)
+                    self._transient_line(
+                        f"💭 thinking\u2026 ({est_tokens} tokens)")
                 if delta.content:
-                    self.on_text("\x1b[0m\n")
+                    if self.show_reasoning:
+                        self.on_text("\x1b[0m\n")
+                    else:
+                        self._transient_line(clear=True)
                     in_reasoning = False
                     text_parts.append(delta.content)
                     self.on_text(delta.content)
@@ -235,6 +335,14 @@ class Agent:
                 if delta.content:
                     text_parts.append(delta.content)
                     self.on_text(delta.content)
+            # P1-16: reset ANSI color before tool-call deltas if still in
+            # reasoning (prevents colour bleed with thinking models).
+            if delta.tool_calls and in_reasoning:
+                if self.show_reasoning:
+                    self.on_text("\x1b[0m\n")
+                else:
+                    self._transient_line(clear=True)
+                in_reasoning = False
             for tc in delta.tool_calls or []:
                 slot = calls.setdefault(tc.index, {
                     "id": "", "type": "function",
@@ -248,10 +356,17 @@ class Agent:
                     if tc.function.arguments:
                         slot["function"]["arguments"] += tc.function.arguments
 
-        if in_reasoning:  # stream ended mid-reasoning; restore normal color
-            self.on_text("\x1b[0m\n")
+        if in_reasoning:  # stream ended mid-reasoning; clean up display
+            if self.show_reasoning:
+                self.on_text("\x1b[0m\n")
+            else:
+                self._transient_line(clear=True)
         if text_parts:
             self.on_text("\n")
+        # P1-7: warn if the model stopped because it hit the output length limit
+        if finish_reason == "length":
+            print("\x1b[33m[devbot] Warning: response truncated "
+                  "(finish_reason=length).\x1b[0m")
         tool_calls = [calls[i] for i in sorted(calls)] or None
         return "".join(text_parts), tool_calls
 
@@ -292,6 +407,7 @@ class Agent:
                 model=self.model,
                 messages=compress_msgs,
                 stream=False,
+                timeout=60,
             )
             summary = resp.choices[0].message.content
             if resp.usage:

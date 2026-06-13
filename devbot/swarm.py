@@ -5,10 +5,18 @@ fresh Agent with a specialist system prompt and a restricted tool set, runs its
 own agentic loop, and returns the specialist's final answer to the manager.
 
 Specialists never get the delegate tool themselves, so there is no recursion.
+
+Megaswarm (`megadelegate`): delegates the same task to N specialists *in parallel*
+(default 3, configurable via the `n` parameter), then hands their outputs to a
+reviewer who synthesises a single combined answer for the manager. This gives a
+more robust result by triangulating independent analyses.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
+import os
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -130,3 +138,224 @@ def run_specialist(manager: "Agent", role: str, task: str) -> str:
     manager.total_tokens += sub.total_tokens
     manager.delegation_count += 1
     return answer or "(specialist returned no text)"
+
+
+# ---------------------------------------------------------------------------
+#  Megaswarm — 3 agents in parallel → reviewer synthesises
+# ---------------------------------------------------------------------------
+
+# Which three roles to launch in parallel. The idea is to attack the problem
+# from three complementary angles so the reviewer can triangulate.
+MEGASWARM_TRIO: tuple[str, str, str] = ("coder", "researcher", "tester")
+
+MEGASWARM_REVIEWER_PROMPT = (
+    "You are a synthesis REVIEWER in a megaswarm. Several specialist agents have just "
+    "worked on the SAME task independently and produced separate reports. "
+    "Your job is to read all outputs carefully and produce a single, coherent, "
+    "combined answer for the manager.\n\n"
+    "Guidelines:\n"
+    "- Identify where the specialists agree — that is the high-confidence core.\n"
+    "- Note any disagreements or different approaches and explain the trade-offs.\n"
+    "- Merge complementary insights across all reports.\n"
+    "- Produce one final, actionable synthesis. Be concise but complete.\n"
+    "- If one specialist clearly had the best answer, lean on it but still incorporate "
+    "unique insights from the others."
+)
+
+
+def megadelegate_schema() -> dict:
+    """The `megadelegate` tool definition added to the manager's tool set."""
+    roles = ", ".join(MEGASWARM_TRIO)
+    return {
+        "type": "function",
+        "function": {
+            "name": "megadelegate",
+            "description": (
+                "MEGASWARM: delegate the SAME task to N specialists "
+                f"(default 3: {roles}) running IN PARALLEL. Their independent "
+                "outputs are then fed to a reviewer who synthesises a single "
+                "combined answer. Use this when you want a robust, triangulated "
+                "result for a complex or high-stakes task.\n"
+                "Optional `n` controls parallelism (e.g. 5 for more triangulation). "
+                "Optional `role` launches N copies of that single role instead of "
+                "the default trio."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "A clear, self-contained description of the subtask.",
+                    },
+                    "n": {
+                        "type": "integer",
+                        "description": "Number of parallel specialists (default 3, max "
+                        "capped by DEVBOT_MAX_PARALLEL env var which defaults to 8).",
+                    },
+                    "role": {
+                        "type": "string",
+                        "enum": list(SPECIALISTS),
+                        "description": "If set, launch N copies of this single role "
+                        "instead of cycling through the default trio.",
+                    },
+                },
+                "required": ["task"],
+            },
+        },
+    }
+
+
+def run_megaswarm(manager: "Agent", task: str, n: int = 3,
+                  role: str | None = None) -> str:
+    """Run N specialists in parallel, then hand outputs to a reviewer for synthesis.
+
+    If *role* is given, launch N copies of that role.  Otherwise cycle through
+    the default trio (``MEGASWARM_TRIO``) for N positions.
+    """
+    from .agent import Agent, TOOL_SCHEMAS  # local import avoids circular dependency
+
+    # ---- Guard n ----------------------------------------------------------
+    n = max(1, int(n))
+
+    # ---- Resolve the list of roles to launch -------------------------------
+    if role is not None:
+        if role not in SPECIALISTS:
+            return f"Error: unknown specialist '{role}'. Choose one of: {', '.join(SPECIALISTS)}"
+        role_list = [role] * n
+    else:
+        role_list = [MEGASWARM_TRIO[i % len(MEGASWARM_TRIO)] for i in range(n)]
+
+    # ---- Concurrency cap & semaphore ---------------------------------------
+    max_parallel = int(os.environ.get("DEVBOT_MAX_PARALLEL", "8"))
+    max_workers = min(n, max_parallel)
+    sem = threading.Semaphore(max_workers)
+
+    # ---- Token budget -------------------------------------------------------
+    token_budget = int(os.environ.get("DEVBOT_TOKEN_BUDGET", "0"))
+
+    label_desc = f"role={role}," if role else ""
+    print(f"\n\x1b[35;1m╔═ MEGASWARM [n={n}, {label_desc} workers={max_workers}]\x1b[0m "
+          f"\x1b[90m{task[:100]}\x1b[0m")
+
+    # ---- Phase 1: run specialists in parallel ------------------------------
+    start = time.time()
+
+    def _run_one(_role: str, _sem: threading.Semaphore) -> tuple[str, str, int]:
+        """Run a single specialist and return (role, answer, tokens)."""
+        spec = SPECIALISTS[_role]
+        allowed = spec["tools"]
+        schemas = (TOOL_SCHEMAS if allowed is None
+                   else [s for s in TOOL_SCHEMAS if s["function"]["name"] in allowed])
+        sub = Agent(
+            root=manager.root,
+            model=spec["model"] or manager.model,
+            auto_approve=manager.auto_approve,
+            system_prompt=spec["prompt"],
+            tool_schemas=schemas,
+            label=_role,
+        )
+        sub.client = manager.client
+        # Parallel agents would interleave streaming output. Silence hooks and
+        # surface a clean status line on completion instead.
+        sub.on_text = lambda chunk: None
+        sub.on_tool_start = lambda name, args: None
+        sub.on_tool_end = lambda result: None
+        sub._transient_line = lambda text, clear=False: None  # silence thinking indicator too
+        # Interactive approval can't work in the parallel phase (agents would
+        # race on stdin). Honor the manager's setting instead: if the user ran
+        # with -y, auto-approve; otherwise DECLINE dangerous tools rather than
+        # silently running file writes / shell commands without consent.
+        if manager.auto_approve:
+            sub.confirm = lambda name, args: True
+        else:
+            sub.confirm = lambda name, args: False
+        try:
+            _sem.acquire()
+            answer = sub.run(task)
+        except Exception as exc:
+            answer = f"ERROR: {type(exc).__name__}: {exc}"
+        finally:
+            _sem.release()
+        return _role, (answer or "(specialist returned no text)"), sub.total_tokens
+
+    results: dict[str, str] = {}
+    skipped = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures: dict[concurrent.futures.Future, str] = {}
+        for r in role_list:
+            futures[pool.submit(_run_one, r, sem)] = r
+
+        for fut in concurrent.futures.as_completed(futures):
+            r, answer, tokens = fut.result()
+            # If multiple agents share the same role, de-duplicate keys:
+            # "coder", "coder-2", "coder-3", ...
+            key = r
+            if key in results:
+                seq = 2
+                while f"{key}-{seq}" in results:
+                    seq += 1
+                key = f"{key}-{seq}"
+            results[key] = answer
+            manager.total_tokens += tokens
+            manager.delegation_count += 1
+            print(f"\x1b[35m  ╟─ [{key}] finished ({tokens:,} tokens)\x1b[0m")
+
+            # Check token budget after each agent completes.
+            # If exceeded, cancel remaining unfinished futures so we don't
+            # burn more tokens on agents that haven't started yet.
+            if token_budget > 0 and manager.total_tokens >= token_budget:
+                for f in futures:
+                    if not f.done():
+                        f.cancel()
+                        skipped += 1
+                if skipped:
+                    print(f"\x1b[33m  ╟─ Token budget exhausted "
+                          f"({manager.total_tokens:,} >= {token_budget:,}); "
+                          f"skipped {skipped} remaining agent(s)\x1b[0m")
+                break
+
+    phase1_elapsed = time.time() - start
+    launched = len(results)
+    note = f" ({skipped} skipped — budget)" if skipped else ""
+    print(f"\x1b[35m  ╠═ Phase 1 done in {phase1_elapsed:.1f}s — "
+          f"{launched} agent(s) ran{note} — handing to reviewer\x1b[0m")
+
+    if not results:
+        return ("(megaswarm: no agents ran — token budget already exhausted "
+                "before any agent could start)")
+
+    # ---- Phase 2: reviewer synthesises the outputs -------------------------
+    review_task = (
+        "Synthesise the following specialist outputs into ONE combined answer "
+        "for the manager.\n\n"
+        f"=== ORIGINAL TASK ===\n{task}\n\n"
+        + "\n\n".join(f"=== {k.upper()} OUTPUT ===\n{txt}"
+                      for k, txt in results.items())
+    )
+
+    reviewer_spec = SPECIALISTS["reviewer"]
+    allowed = reviewer_spec["tools"]
+    schemas = [s for s in TOOL_SCHEMAS if s["function"]["name"] in allowed]
+    reviewer = Agent(
+        root=manager.root,
+        model=reviewer_spec["model"] or manager.model,
+        auto_approve=manager.auto_approve,
+        system_prompt=MEGASWARM_REVIEWER_PROMPT,
+        tool_schemas=schemas,
+        label="reviewer",
+    )
+    reviewer.client = manager.client
+
+    print(f"\x1b[35m  ╟─ [reviewer] synthesising...\x1b[0m")
+    phase2_start = time.time()
+    synthesis = reviewer.run(review_task)
+    phase2_elapsed = time.time() - phase2_start
+    total_elapsed = time.time() - start
+
+    manager.total_tokens += reviewer.total_tokens
+    manager.delegation_count += 1
+
+    print(f"\x1b[35m  ╟─ [reviewer] done in {phase2_elapsed:.1f}s\x1b[0m")
+    print(f"\x1b[35;1m╚═ MEGASWARM complete in {total_elapsed:.1f}s\x1b[0m")
+
+    return synthesis or "(megaswarm reviewer returned no text)"

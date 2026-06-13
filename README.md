@@ -70,7 +70,7 @@ In the REPL:
 
 DevBot tracks token usage per call and warns (and auto-compresses) when a prompt
 approaches the 1M context limit. Set `DEVBOT_MAX_TURNS` to cap tool iterations
-per message (default 40).
+per message (default 200).
 
 When the model wants to write a file or run a command you'll get a prompt:
 `y` allows once, `a` allows everything for the rest of the session, anything
@@ -99,6 +99,25 @@ is returned to the manager, which synthesizes the results.
 Sub-agents never get the `delegate` tool themselves (no recursion) and still
 respect approval gates. Specialist definitions live in
 [`devbot/swarm.py`](devbot/swarm.py).
+
+### Megaswarm mode
+
+Run with `--megaswarm` (or `-M`, or toggle with `/megaswarm`) for a heavier
+pattern. The manager additionally gets a `megadelegate(task)` tool that:
+
+1. Launches the trio (`coder`, `researcher`, `tester`) **in parallel** on the same task.
+2. Hands their three independent outputs to a `reviewer` that synthesizes one combined answer.
+
+```sh
+devbot --megaswarm "refactor the auth module to async"
+```
+
+Because the trio runs concurrently, their per-token streaming is silenced during
+the parallel phase (you get a clean per-agent status line instead); the reviewer's
+synthesis streams normally. Approval prompts are serialized across threads.
+
+> **Tip:** run megaswarm with `-y` (auto-approve). With approval on, the parallel
+> `coder` will block waiting for confirmation, which is awkward mid-parallel-run.
 
 ## Configuration
 
