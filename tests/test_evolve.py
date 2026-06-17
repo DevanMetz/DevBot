@@ -24,12 +24,14 @@ from devbot.evolve import run_evolve
 class _FakeAgent:
     """A stand-in for ``devbot.agent.Agent`` that records ``.run()`` calls."""
 
-    def __init__(self, root=None, model=None, auto_approve=None, megaswarm=None):
+    def __init__(self, root=None, model=None, auto_approve=None, megaswarm=None,
+                 provider=None):
         # Store constructor args for assertions.
         self.root = root
         self.model = model
         self.auto_approve = auto_approve
         self.megaswarm = megaswarm
+        self.provider = provider
         self.runs: list[str] = []
 
     def run(self, prompt: str) -> str:

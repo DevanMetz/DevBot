@@ -1,6 +1,7 @@
 """Interactive REPL entry point: `devbot` or `python -m devbot`."""
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from pathlib import Path
 # Either way it auto-hooks input() on import, so we just try and move on.
 # Module-level list of slash commands used by both the completer and the REPL loop.
 _SLASH_COMMANDS = [
-    "/help", "/clear", "/stats", "/model", "/think", "/swarm", "/megaswarm",
+    "/help", "/clear", "/stats", "/model", "/local", "/cloud", "/think", "/swarm", "/megaswarm",
     "/resume", "/sessions", "/exit", "/tools", "/cost", "/export", "/undo",
 ]
 
@@ -63,7 +64,26 @@ _setup_readline()
 from openai import AuthenticationError, PermissionDeniedError
 
 from . import __version__
-from .agent import Agent, DEFAULT_MODEL, KNOWN_MODELS
+from .agent import Agent, DEFAULT_MODEL, KNOWN_MODELS, LOCAL_MODEL_ALIASES, LOCAL_PROVIDER_NAME
+
+
+def _make_agent(
+    root: Path,
+    *,
+    model: str | None,
+    auto_approve: bool,
+    swarm: bool,
+    megaswarm: bool,
+    provider: str | None,
+) -> Agent:
+    return Agent(
+        root=root,
+        model=model,
+        auto_approve=auto_approve,
+        swarm=swarm,
+        megaswarm=megaswarm,
+        provider=provider,
+    )
 
 
 def _friendly_api_error(e: Exception) -> str | None:
@@ -84,7 +104,9 @@ Commands:
   /help          show this help
   /clear         reset the conversation (keeps system prompt)
   /stats         show token usage and message count
-  /model <name>  switch model (deepseek-v4-flash, deepseek-v4-pro)
+  /model <name>  switch model (deepseek-v4-flash, deepseek-v4-pro, or local model id)
+  /local         switch to VibeThinker Local (resets conversation)
+  /cloud         switch back to DeepSeek (resets conversation)
   /auto          toggle auto-approve of tool calls
   /think         toggle display of full chain-of-thought
   /swarm         toggle swarm mode (delegate to specialists; resets conversation)
@@ -102,15 +124,19 @@ BANNER = """\x1b[1m
  | | | |/ _ \\ \\ / /  _ \\ / _ \\| __|
  | |_| |  __/\\ V /| |_) | (_) | |_
  |____/ \\___| \\_/ |____/ \\___/ \\__|  v{version}
-\x1b[0m  DeepSeek-powered coding agent · model: {model}{mode} · cwd: {cwd}
+\x1b[0m  OpenAI-compatible coding agent · provider: {provider} · model: {model}{mode} · cwd: {cwd}
   Type /help for commands.
 """
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="devbot", description="DeepSeek-powered CLI coding agent")
+    parser = argparse.ArgumentParser(prog="devbot", description="OpenAI-compatible CLI coding agent")
     parser.add_argument("prompt", nargs="*", help="One-shot prompt (omit for interactive mode)")
     parser.add_argument("-m", "--model", default=None, help=f"Model id (default: {DEFAULT_MODEL})")
+    parser.add_argument("--provider", choices=["deepseek", LOCAL_PROVIDER_NAME],
+                        default=None, help="LLM provider to use")
+    parser.add_argument("--local", action="store_true",
+                        help="Use the local VibeThinker llama.cpp server")
     parser.add_argument("-y", "--yes", action="store_true", help="Auto-approve all tool calls")
     parser.add_argument("-C", "--cwd", default=".", help="Project root to operate in")
     parser.add_argument("-s", "--swarm", action="store_true",
@@ -132,13 +158,14 @@ def main():
     args = parser.parse_args()
 
     root = Path(args.cwd).resolve()
+    provider = LOCAL_PROVIDER_NAME if args.local else args.provider
 
     # Autopilot: run a whole plan unattended, phase by phase.
     if args.run_plan is not None:
         from .autopilot import run_plan
         print("\x1b[33m[devbot] Autopilot runs unattended with auto-approve and "
               "shell access. Ctrl+C to stop.\x1b[0m")
-        ok = run_plan(root, args.run_plan, model=args.model)
+        ok = run_plan(root, args.run_plan, model=args.model, provider=provider)
         sys.exit(0 if ok else 1)
 
     # Autopilot: self-evolving loop that plans, critiques, and implements unattended.
@@ -148,7 +175,7 @@ def main():
               "with auto-approve and shell access. It will plan, critique, and "
               "implement phases, committing each green one. NEVER runs on main/master. "
               "Ctrl+C to stop.\x1b[0m")
-        ok = run_evolve(root, args.model)
+        ok = run_evolve(root, args.model, provider=provider)
         sys.exit(0 if ok else 1)
 
     # Handle --resume: restore from a saved session.
@@ -167,14 +194,17 @@ def main():
         print(f"[devbot] Resumed session {agent.session_id} "
               f"({agent.total_tokens:,} tokens, {len(agent.messages)} messages)")
     else:
-        agent = Agent(root=root, model=args.model, auto_approve=args.yes,
-                      swarm=args.swarm, megaswarm=args.megaswarm)
+        agent = _make_agent(root, model=args.model, auto_approve=args.yes,
+                            swarm=args.swarm, megaswarm=args.megaswarm,
+                            provider=provider)
 
     if args.prompt:  # one-shot mode: devbot "fix the failing test"
         agent.run(" ".join(args.prompt))
         return
 
-    print(BANNER.format(version=__version__, model=agent.model,
+    print(BANNER.format(version=__version__,
+                        provider=getattr(agent, "provider_display_name", "DeepSeek"),
+                        model=agent.model,
                         mode=" · megaswarm" if agent.megaswarm else (" · swarm" if agent.swarm else ""),
                         cwd=root))
     while True:
@@ -216,13 +246,36 @@ def main():
         if user.startswith("/model"):
             parts = user.split(maxsplit=1)
             if len(parts) == 2:
-                if parts[1] not in KNOWN_MODELS:
-                    print(f"\x1b[33m[warning] '{parts[1]}' is not a known DeepSeek model "
-                          f"({', '.join(sorted(KNOWN_MODELS))}). Setting it anyway.\x1b[0m")
-                agent.model = parts[1]
+                requested = parts[1]
+                if requested.lower() in LOCAL_MODEL_ALIASES:
+                    if getattr(agent, "provider_name", "") != LOCAL_PROVIDER_NAME:
+                        print("\x1b[33m[warning] local-vibethinker is a provider alias. "
+                              "Restart with DEVBOT_PROVIDER=local-vibethinker to switch "
+                              "the client base URL.\x1b[0m")
+                    requested = os.environ.get("LOCAL_LLM_MODEL", "vibethinker-q4-vulkan")
+                if requested not in KNOWN_MODELS and requested.lower() not in LOCAL_MODEL_ALIASES:
+                    if getattr(agent, "provider_name", "") == LOCAL_PROVIDER_NAME:
+                        print(f"\x1b[33m[warning] '{requested}' is not the configured local "
+                              "model name. Setting it anyway.\x1b[0m")
+                    else:
+                        print(f"\x1b[33m[warning] '{requested}' is not a known DeepSeek model "
+                              f"({', '.join(sorted(KNOWN_MODELS))}). Setting it anyway.\x1b[0m")
+                agent.model = requested
                 print(f"[model: {agent.model}]")
             else:
                 print(f"[model: {agent.model}]  Usage: /model <name>  (current: {agent.model})")
+            continue
+        if user == "/local":
+            agent = _make_agent(root, model=None, auto_approve=agent.auto_approve,
+                                swarm=agent.swarm, megaswarm=agent.megaswarm,
+                                provider=LOCAL_PROVIDER_NAME)
+            print(f"[provider: {agent.provider_display_name} | model: {agent.model} | conversation reset]")
+            continue
+        if user == "/cloud":
+            agent = _make_agent(root, model=None, auto_approve=agent.auto_approve,
+                                swarm=agent.swarm, megaswarm=agent.megaswarm,
+                                provider="deepseek")
+            print(f"[provider: {agent.provider_display_name} | model: {agent.model} | conversation reset]")
             continue
         if user == "/auto":
             agent.auto_approve = not agent.auto_approve
@@ -230,7 +283,10 @@ def main():
             continue
         if user == "/think":
             agent.show_reasoning = not agent.show_reasoning
-            print(f"[show reasoning: {'on' if agent.show_reasoning else 'off'}]")
+            suffix = " | local VibeThinker may use more tokens" if (
+                agent.show_reasoning and getattr(agent, "provider_name", "") == LOCAL_PROVIDER_NAME
+            ) else ""
+            print(f"[show reasoning: {'on' if agent.show_reasoning else 'off'}{suffix}]")
             continue
         if user == "/swarm":
             # Recreate the agent with swarm toggled; this resets the conversation
@@ -240,15 +296,17 @@ def main():
                 enable = True
             else:
                 enable = not agent.swarm
-            agent = Agent(root=root, model=agent.model, auto_approve=agent.auto_approve,
-                          swarm=enable, megaswarm=False)
+            agent = _make_agent(root, model=agent.model, auto_approve=agent.auto_approve,
+                                swarm=enable, megaswarm=False,
+                                provider=getattr(agent, "provider_name", None))
             print(f"[swarm mode: {'on' if agent.swarm else 'off'} — conversation reset]")
             continue
         if user == "/megaswarm":
             # Toggle megaswarm on/off (megaswarm implies swarm).
             enable = not agent.megaswarm
-            agent = Agent(root=root, model=agent.model, auto_approve=agent.auto_approve,
-                          swarm=enable, megaswarm=enable)
+            agent = _make_agent(root, model=agent.model, auto_approve=agent.auto_approve,
+                                swarm=enable, megaswarm=enable,
+                                provider=getattr(agent, "provider_name", None))
             print(f"[megaswarm mode: {'on' if enable else 'off'} — conversation reset]")
             continue
         if user == "/sessions":

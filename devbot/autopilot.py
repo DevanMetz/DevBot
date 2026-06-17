@@ -75,7 +75,7 @@ def _run_tests(root: Path) -> tuple[bool, str]:
 
 
 def run_plan(root: Path, plan_path: str = "plan.md", model: str | None = None,
-             max_phases: int = 20) -> bool:
+             max_phases: int = 20, provider: str | None = None) -> bool:
     """Implement every phase in *plan_path* sequentially. Returns True if all
     phases completed with green tests, False if it stopped early."""
     plan_file = root / plan_path
@@ -96,7 +96,8 @@ def run_plan(root: Path, plan_path: str = "plan.md", model: str | None = None,
     print(f"\x1b[36;1m[autopilot] running {len(phases)} phase(s) from {plan_path}\x1b[0m")
 
     def _agent() -> Agent:
-        return Agent(root=root, model=model, auto_approve=True, megaswarm=True)
+        return Agent(root=root, model=model, auto_approve=True, megaswarm=True,
+                     provider=provider)
 
     for idx, ph in enumerate(phases, 1):
         if check_global_budget_exceeded():

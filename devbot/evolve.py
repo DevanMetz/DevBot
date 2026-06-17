@@ -72,7 +72,7 @@ def _read_readme(root: Path) -> str:
 # Main driver
 # ---------------------------------------------------------------------------
 
-def run_evolve(root: Path, model: str | None = None) -> bool:
+def run_evolve(root: Path, model: str | None = None, provider: str | None = None) -> bool:
     """Run the auto-evolve loop.
 
     Parameters
@@ -82,6 +82,8 @@ def run_evolve(root: Path, model: str | None = None) -> bool:
     model : str | None
         Model id to use for all agents (default: ``DEVBOT_MODEL`` env or
         the built-in default).
+    provider : str | None
+        Provider id to use for all agents, e.g. ``local-vibethinker``.
 
     Returns
     -------
@@ -101,13 +103,16 @@ def run_evolve(root: Path, model: str | None = None) -> bool:
     from devbot.agent import Agent, get_global_token_count
     from devbot.autopilot import _run_tests
 
-    # Pre-flight: load .env so the API-key check works for users who keep
-    # their key in the repo's .env file rather than in the shell environment.
-    from devbot.agent import _load_dotenv
+    # Pre-flight: load project config/.env so provider/key checks match Agent.
+    from devbot.agent import _load_dotenv, get_llm_provider_settings
+    from devbot.config import load_project_config, apply_project_config
+    load_project_config(root)
     _load_dotenv(root)
-    if not os.environ.get("DEEPSEEK_API_KEY"):
+    apply_project_config()
+    provider_settings = get_llm_provider_settings(model, provider)
+    if provider_settings.requires_deepseek_key and not provider_settings.api_key:
         print("[auto-evolve] DEEPSEEK_API_KEY is not set.  Please set it and "
-              "try again.")
+              "try again, or set DEVBOT_PROVIDER=local-vibethinker.")
         return False
 
     root_str = str(root)
@@ -166,7 +171,7 @@ def run_evolve(root: Path, model: str | None = None) -> bool:
         # --- Generate plan ---
         try:
             manager = Agent(root=root, model=model, auto_approve=True,
-                            megaswarm=True)
+                            megaswarm=True, provider=provider)
             proposed = generate_plan(manager, context)
             cost_estimate += manager.estimated_cost()
         except (Exception, SystemExit) as exc:
@@ -182,7 +187,7 @@ def run_evolve(root: Path, model: str | None = None) -> bool:
         # --- Critique plan ---
         try:
             critic = Agent(root=root, model=model, auto_approve=True,
-                           megaswarm=True)
+                           megaswarm=True, provider=provider)
             surviving = critique_plan(critic, proposed)
             cost_estimate += critic.estimated_cost()
         except (Exception, SystemExit) as exc:
@@ -208,7 +213,7 @@ def run_evolve(root: Path, model: str | None = None) -> bool:
 
             try:
                 impl_agent = Agent(root=root, model=model, auto_approve=True,
-                                   megaswarm=True)
+                                   megaswarm=True, provider=provider)
                 prompt = (
                     f"You are implementing one phase of a multi-phase plan.\n\n"
                     f"=== PHASE ===\n# {title}\n{body}\n\n"
@@ -238,7 +243,7 @@ def run_evolve(root: Path, model: str | None = None) -> bool:
                       f"one fix round")
                 try:
                     fix_agent = Agent(root=root, model=model, auto_approve=True,
-                                      megaswarm=True)
+                                      megaswarm=True, provider=provider)
                     fix_agent.run(
                         f"After implementing this phase, the test suite is "
                         f"FAILING:\n\n{body}\n\n=== PYTEST OUTPUT ===\n{out}\n\n"

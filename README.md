@@ -1,6 +1,6 @@
 # DevBot
 
-A Claude Code–style CLI coding agent powered by the [DeepSeek API](https://platform.deepseek.com).
+A Claude Code-style CLI coding agent powered by OpenAI-compatible chat APIs.
 
 DevBot runs an agentic loop in your terminal: you describe a task, the model reads
 your code with tools, edits files, and runs commands (with your approval) until the
@@ -8,7 +8,7 @@ task is done.
 
 ## Features
 
-- **Streaming agentic loop** with OpenAI-compatible function calling against DeepSeek.
+- **Streaming agentic loop** with OpenAI-compatible function calling against DeepSeek or a local llama.cpp server.
 - **Twelve built-in tools** for reading, searching, editing, running, web-searching, and testing code.
 - **Pipeline mode** — mandatory review→fix loop so every code change is audited before it ships.
 - **Session persistence** — sessions auto-save after each turn; resume later with `--resume` or `/resume`.
@@ -64,6 +64,50 @@ $env:DEEPSEEK_API_KEY = "sk-..."   # PowerShell
 # export DEEPSEEK_API_KEY=sk-...   # bash/zsh
 ```
 
+### Local VibeThinker
+
+DevBot can use the local VibeThinker-3B llama.cpp/Vulkan server as another
+OpenAI-compatible provider.
+
+Start the model server:
+
+```powershell
+& "C:\Users\Devan\Documents\Codex\2026-06-16\hey-how-can-i-run-this\outputs\vibethinker-vulkan\start-vibethinker-q4-vulkan.ps1"
+```
+
+Then start DevBot with the local provider:
+
+```sh
+devbot --local
+devbot --local "fix the failing test"
+```
+
+Inside the REPL, you can switch providers without restarting:
+
+```text
+/local
+/cloud
+```
+
+The default local connection is `http://127.0.0.1:8092/v1` with model
+`vibethinker-q4-vulkan`, API key `local`, and a 600-token local output cap.
+For custom local servers, set:
+
+```powershell
+$env:LOCAL_LLM_BASE_URL = "http://127.0.0.1:8092/v1"
+$env:LOCAL_LLM_MODEL = "vibethinker-q4-vulkan"
+$env:LOCAL_LLM_API_KEY = "local"
+$env:LOCAL_LLM_MAX_TOKENS = "600"
+```
+
+You can check the server with:
+
+```sh
+python -m devbot.local_llm_health
+# or, after reinstalling with pip install -e .
+devbot-local-health
+```
+
 ## Usage
 
 ```sh
@@ -74,6 +118,7 @@ devbot -m deepseek-v4-pro    # use the more capable model for harder tasks
 devbot -C path/to/project    # operate on another directory
 devbot -s                    # swarm mode
 devbot -M                    # megaswarm mode (3 parallel agents + reviewer)
+devbot --local               # use local VibeThinker instead of DeepSeek
 devbot --run-plan            # autopilot: implement each `## Phase` from plan.md
 devbot --run-plan my-plan.md # use a custom plan file
 devbot --resume              # resume the latest saved session
@@ -86,6 +131,8 @@ In the REPL:
 - `/clear` — reset the conversation (keeps system prompt)
 - `/stats` — show token usage (last prompt + session total) and message count
 - `/model <name>` — switch model (`deepseek-v4-flash` or `deepseek-v4-pro`; warns on unknown names)
+- `/local` — switch to VibeThinker Local (resets the conversation)
+- `/cloud` — switch back to DeepSeek (resets the conversation)
 - `/auto` — toggle auto-approve
 - `/think` — toggle display of chain-of-thought reasoning
 - `/swarm` — toggle swarm mode (resets the conversation)
@@ -179,8 +226,13 @@ integrates the results.
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | API key (required) | — |
+| `DEEPSEEK_API_KEY` | DeepSeek API key (required for the default provider) | — |
+| `DEVBOT_PROVIDER` | LLM provider (`deepseek` or `local-vibethinker`) | `deepseek` |
 | `DEVBOT_MODEL` | Model id | `deepseek-v4-flash` |
+| `LOCAL_LLM_BASE_URL` | Local OpenAI-compatible base URL | `http://127.0.0.1:8092/v1` |
+| `LOCAL_LLM_MODEL` | Local model id | `vibethinker-q4-vulkan` |
+| `LOCAL_LLM_API_KEY` | Local server API key placeholder | `local` |
+| `LOCAL_LLM_MAX_TOKENS` | Max output tokens for local model calls | 600 |
 | `DEVBOT_MAX_TURNS` | Max tool iterations per message | 200 |
 | `DEVBOT_MAX_PARALLEL` | Max parallel agents in megaswarm | 8 |
 | `DEVBOT_TOKEN_BUDGET` | Per-agent token cap (0 = unlimited) | 0 |
@@ -205,6 +257,12 @@ You can also put these in a `.env` file in your project root instead of exportin
 ```
 DEEPSEEK_API_KEY=sk-...
 DEVBOT_MODEL=deepseek-v4-flash
+# For local VibeThinker instead:
+# DEVBOT_PROVIDER=local-vibethinker
+# LOCAL_LLM_BASE_URL=http://127.0.0.1:8092/v1
+# LOCAL_LLM_MODEL=vibethinker-q4-vulkan
+# LOCAL_LLM_API_KEY=local
+# LOCAL_LLM_MAX_TOKENS=600
 DEVBOT_VERBOSITY=concise
 DEVBOT_MAX_TOOL_OUTPUT=12000
 DEVBOT_SPECIALIST_RESULT_LIMIT=4000
@@ -217,6 +275,12 @@ You can also put these settings in a `.devbot/config.toml` file in your project 
 ```toml
 # .devbot/config.toml (all keys optional)
 model = "deepseek-v4-pro"
+# Or use local VibeThinker:
+# provider = "local-vibethinker"
+# local_llm_base_url = "http://127.0.0.1:8092/v1"
+# local_llm_model = "vibethinker-q4-vulkan"
+# local_llm_api_key = "local"
+# local_llm_max_tokens = 600
 max_parallel = 4
 token_budget = 100000
 loop_limit = 5

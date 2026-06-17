@@ -87,21 +87,24 @@ class TestTimeLimit:
 
     def test_before_time_limit_no_stop(self, monkeypatch):
         monkeypatch.setenv("DEVBOT_EVOLVE_TIME_LIMIT", "10")
+        # Pin the clock to a small, exact base before start() so elapsed
+        # arithmetic is free of float cancellation (real monotonic() values
+        # are large and (base + delta) - base can drift below delta).
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
         sc = StopController()
         sc.start()
         # Simulate only 1 minute elapsed (limit is 10 min)
-        fake_now = sc._start_time + 60  # 1 minute
-        monkeypatch.setattr(time, "monotonic", lambda: fake_now)
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0 + 60)
         stopped, _ = sc.should_stop()
         assert stopped is False
 
     def test_after_time_limit_stops(self, monkeypatch):
         monkeypatch.setenv("DEVBOT_EVOLVE_TIME_LIMIT", "2")
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
         sc = StopController()
         sc.start()
         # Simulate 2 minutes elapsed exactly (limit is 2 min = 120 s)
-        fake_now = sc._start_time + 120
-        monkeypatch.setattr(time, "monotonic", lambda: fake_now)
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0 + 120)
         stopped, reason = sc.should_stop()
         assert stopped is True
         assert "Time limit exceeded" in reason
@@ -109,11 +112,11 @@ class TestTimeLimit:
 
     def test_past_time_limit_stops(self, monkeypatch):
         monkeypatch.setenv("DEVBOT_EVOLVE_TIME_LIMIT", "1")
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
         sc = StopController()
         sc.start()
         # Way past the limit
-        fake_now = sc._start_time + 999
-        monkeypatch.setattr(time, "monotonic", lambda: fake_now)
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0 + 999)
         stopped, reason = sc.should_stop()
         assert stopped is True
         assert "Time limit exceeded" in reason
