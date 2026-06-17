@@ -16,6 +16,7 @@ win = ["pyreadline3>=3.5"]
 
 [project.scripts]
 devbot = "devbot.cli:main"
+devbot-local-health = "devbot.local_llm_health:main"
 
 [tool.setuptools]
 packages = ["devbot"]

@@ -3,7 +3,13 @@
 These mock the sub-agent runners so no real API calls / tokens are used.
 """
 import devbot.swarm as swarm
-from devbot.swarm import megadelegate_schema, pipeline_schema, run_megaswarm, run_pipeline
+from devbot.swarm import (
+    _clip_agent_result,
+    megadelegate_schema,
+    pipeline_schema,
+    run_megaswarm,
+    run_pipeline,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +43,14 @@ class TestMegaswarmValidation:
     def test_unknown_role_returns_error(self):
         out = run_megaswarm(None, "goal", role="wizard")
         assert "unknown specialist" in out.lower()
+
+
+class TestTokenEfficiency:
+    def test_specialist_result_clip_is_configurable(self, monkeypatch):
+        monkeypatch.setenv("DEVBOT_SPECIALIST_RESULT_LIMIT", "500")
+        out = _clip_agent_result("x" * 650, "coder")
+        assert len(out) < 650
+        assert "coder truncated" in out
 
 
 # ---------------------------------------------------------------------------

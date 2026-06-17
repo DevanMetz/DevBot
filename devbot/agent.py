@@ -2,9 +2,11 @@
 
 import json
 import os
+import re
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -78,6 +80,136 @@ def _load_dotenv(root: Path):
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"  # use "deepseek-v4-pro" for harder tasks
 DEFAULT_MAX_TURNS = 200  # tool-loop cap per message; override with DEVBOT_MAX_TURNS
+LOCAL_LLM_DEFAULT_BASE_URL = "http://127.0.0.1:8092/v1"
+LOCAL_LLM_DEFAULT_MODEL = "vibethinker-q4-vulkan"
+LOCAL_LLM_DEFAULT_API_KEY = "local"
+LOCAL_LLM_DEFAULT_MAX_TOKENS = 600
+LOCAL_PROVIDER_NAME = "local-vibethinker"
+LOCAL_PROVIDER_ALIASES = {
+    "local-vibethinker",
+    "vibethinker-local",
+    "vibethinker",
+    "vibethinker local",
+}
+LOCAL_MODEL_ALIASES = LOCAL_PROVIDER_ALIASES | {"vibethinker-local-3b"}
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?(?:</think>|$)", re.IGNORECASE | re.DOTALL)
+_TEXT_TOOL_BLOCK_RE = re.compile(
+    r"<result\b[^>]*>.*?(?:</result>|$)|<json\b[^>]*>.*?(?:</json>|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_TRIVIAL_GREETING_RE = re.compile(
+    r"^\s*(hi|hello|hey|yo|howdy|sup|what'?s up|good (morning|afternoon|evening))[\s!.?]*$",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class LLMProviderSettings:
+    provider: str
+    display_name: str
+    base_url: str
+    api_key: str | None
+    model: str
+    requires_deepseek_key: bool = False
+
+
+def _normalise_provider_name(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalised = value.strip().lower()
+    if normalised in LOCAL_PROVIDER_ALIASES:
+        return LOCAL_PROVIDER_NAME
+    if normalised in {"deepseek", "cloud", "deepseek-cloud"}:
+        return "deepseek"
+    return normalised
+
+
+def get_llm_provider_settings(
+    requested_model: str | None = None,
+    requested_provider: str | None = None,
+) -> LLMProviderSettings:
+    """Resolve the configured OpenAI-compatible provider and model.
+
+    DeepSeek remains the default provider. Local VibeThinker is selected when
+    DEVBOT_PROVIDER names it, when the requested model is a local alias, or
+    when no DeepSeek key is available but LOCAL_LLM_BASE_URL is.
+    """
+    explicit_provider = _normalise_provider_name(
+        requested_provider or os.environ.get("DEVBOT_PROVIDER")
+    )
+    requested = requested_model or os.environ.get("DEVBOT_MODEL")
+    requested_key = (requested or "").strip().lower()
+    local_base_url = os.environ.get("LOCAL_LLM_BASE_URL")
+
+    provider = explicit_provider
+    if provider is None and requested_key in LOCAL_MODEL_ALIASES:
+        provider = LOCAL_PROVIDER_NAME
+    if provider is None and local_base_url and not os.environ.get("DEEPSEEK_API_KEY"):
+        provider = LOCAL_PROVIDER_NAME
+    if provider is None:
+        provider = "deepseek"
+
+    if provider == LOCAL_PROVIDER_NAME:
+        local_model = os.environ.get("LOCAL_LLM_MODEL", LOCAL_LLM_DEFAULT_MODEL)
+        model = local_model if not requested or requested_key in LOCAL_MODEL_ALIASES else requested
+        return LLMProviderSettings(
+            provider=LOCAL_PROVIDER_NAME,
+            display_name="VibeThinker Local",
+            base_url=local_base_url or LOCAL_LLM_DEFAULT_BASE_URL,
+            api_key=os.environ.get("LOCAL_LLM_API_KEY", LOCAL_LLM_DEFAULT_API_KEY),
+            model=model,
+        )
+
+    if provider != "deepseek":
+        raise SystemExit(
+            f"Unknown LLM provider '{provider}'. Supported providers: "
+            "deepseek, local-vibethinker."
+        )
+
+    return LLMProviderSettings(
+        provider="deepseek",
+        display_name="DeepSeek",
+        base_url=DEEPSEEK_BASE_URL,
+        api_key=os.environ.get("DEEPSEEK_API_KEY"),
+        model=requested or DEFAULT_MODEL,
+        requires_deepseek_key=True,
+    )
+
+
+def _clean_local_model_text(text: str) -> tuple[str, bool]:
+    """Hide VibeThinker text-only reasoning and unsupported tool wrappers."""
+    without_thinking = _THINK_BLOCK_RE.sub("", text)
+    saw_text_tool = bool(_TEXT_TOOL_BLOCK_RE.search(without_thinking))
+    cleaned = _TEXT_TOOL_BLOCK_RE.sub("", without_thinking).strip()
+    return cleaned, saw_text_tool
+
+
+def _show_local_model_text(text: str) -> tuple[str, bool]:
+    """Show VibeThinker reasoning while still suppressing pseudo tool wrappers."""
+    saw_text_tool = bool(_TEXT_TOOL_BLOCK_RE.search(text))
+    without_text_tools = _TEXT_TOOL_BLOCK_RE.sub("", text)
+
+    def show_think(match: re.Match) -> str:
+        thought = (match.group(0) or "")
+        thought = re.sub(r"^<think\b[^>]*>|</think>$", "", thought,
+                         flags=re.IGNORECASE | re.DOTALL).strip()
+        return f"\n[thinking]\n{thought}\n[/thinking]\n" if thought else ""
+
+    shown = _THINK_BLOCK_RE.sub(show_think, without_text_tools).strip()
+    return shown, saw_text_tool
+
+
+def _is_trivial_greeting(text: str) -> bool:
+    return bool(_TRIVIAL_GREETING_RE.match(text))
+
+
+def _local_user_content(text: str) -> str:
+    return (
+        "/no_think\n"
+        "Answer directly and briefly. Do not write private reasoning, "
+        "<think> blocks, or pseudo-tool-call XML/JSON.\n\n"
+        f"{text}"
+    )
 
 # Per-1M-token pricing (USD), cache-miss input rates per the DeepSeek pricing
 # page. deepseek-chat / deepseek-reasoner are legacy aliases for V4-flash and
@@ -103,6 +235,26 @@ Guidelines:
 - Keep responses concise. Don't paste entire files back to the user; summarize what changed.
 - If a command fails, read the error and fix the underlying problem rather than retrying blindly.
 - Never run destructive commands (rm -rf, force push, etc.) without explaining why first.
+"""
+
+CONCISE_ADDENDUM = """\
+
+Token-efficiency mode is active.
+- Keep replies short: answer first, then only essential details.
+- Avoid preamble, repetition, hedging, and long status narration.
+- Prefer compact bullets over paragraphs when reporting several facts.
+- Do not paste long command output or file contents; cite the relevant file/line or summarize.
+- For long tasks, keep a tiny working summary of decisions and next actions.
+"""
+
+LOCAL_LLM_ADDENDUM = """\
+
+Local VibeThinker mode is active.
+- /no_think
+- Do not emit chain-of-thought, private reasoning, or <think> blocks.
+- For greetings and small talk, answer directly in one short sentence.
+- Use tools only through API tool_calls. Never print XML, JSON, or pseudo-tool
+  call wrappers such as <result>, <json>, or {"name": ...} as normal text.
 """
 
 MANAGER_ADDENDUM = """\
@@ -162,25 +314,31 @@ class Agent:
     def __init__(self, root: Path, model: str | None = None, auto_approve: bool = False,
                  system_prompt: str | None = None, tool_schemas: list | None = None,
                  swarm: bool = False, megaswarm: bool = False,
-                 label: str | None = None):
+                 label: str | None = None, provider: str | None = None):
         load_project_config(root)   # stores config.toml values for later
         _load_dotenv(root)          # .env overrides config.toml
         apply_project_config()      # apply config.toml (env & .env win)
-        api_key = os.environ.get("DEEPSEEK_API_KEY")
-        if not api_key:
+        provider_settings = get_llm_provider_settings(model, provider)
+        if provider_settings.requires_deepseek_key and not provider_settings.api_key:
             raise SystemExit(
                 "DEEPSEEK_API_KEY is not set.\n"
                 "Get a key at https://platform.deepseek.com and set it:\n"
                 '  PowerShell:  $env:DEEPSEEK_API_KEY = "sk-..."\n'
-                "  bash/zsh:    export DEEPSEEK_API_KEY=sk-..."
+                "  bash/zsh:    export DEEPSEEK_API_KEY=sk-...\n"
+                "Or set DEVBOT_PROVIDER=local-vibethinker to use the local "
+                "VibeThinker server."
             )
         self.client = OpenAI(
-            api_key=api_key, base_url=DEEPSEEK_BASE_URL,
+            api_key=provider_settings.api_key,
+            base_url=provider_settings.base_url,
             http_client=httpx.Client(
                 limits=httpx.Limits(max_connections=64,
                                     max_keepalive_connections=32)),
             timeout=httpx.Timeout(120.0, connect=10.0))
-        self.model = model or os.environ.get("DEVBOT_MODEL", DEFAULT_MODEL)
+        self.provider_name = provider_settings.provider
+        self.provider_display_name = provider_settings.display_name
+        self.base_url = provider_settings.base_url
+        self.model = provider_settings.model
         self.root = root
         self.auto_approve = auto_approve
         self.swarm = swarm
@@ -204,6 +362,8 @@ class Agent:
         self._same_call_count = 0
         self._last_error = None         # last error string for error-loop detection
         self._same_error_count = 0
+        if self.provider_name == LOCAL_PROVIDER_NAME:
+            self.show_reasoning = False
 
         self.tool_schemas = list(tool_schemas) if tool_schemas is not None else list(TOOL_SCHEMAS)
         if swarm or megaswarm:  # the manager gets the delegate + pipeline tools
@@ -218,10 +378,15 @@ class Agent:
             prompt = system_prompt
         else:
             prompt = SYSTEM_PROMPT.format(cwd=root, platform=os.name)
+            if self.provider_name == LOCAL_PROVIDER_NAME:
+                prompt += LOCAL_LLM_ADDENDUM
             if megaswarm:
                 prompt += MANAGER_ADDENDUM + MEGASWARM_ADDENDUM
             elif swarm:
                 prompt += MANAGER_ADDENDUM
+        if os.environ.get("DEVBOT_VERBOSITY", "").lower() in (
+                "concise", "terse", "compact", "caveman"):
+            prompt += CONCISE_ADDENDUM
         self.messages: list[dict] = [{"role": "system", "content": prompt}]
 
     # ---- UI hooks (overridden/used by cli.py) -------------------------------
@@ -327,6 +492,8 @@ class Agent:
         tokens are tracked. If the model isn't in the pricing table, defaults
         to deepseek-v4-flash prices.
         """
+        if getattr(self, "provider_name", "") == LOCAL_PROVIDER_NAME:
+            return 0.0
         pricing = MODEL_PRICING.get(self.model, MODEL_PRICING["deepseek-v4-flash"])
         input_price = pricing["input"] / 1_000_000
         output_price = pricing["output"] / 1_000_000
@@ -359,7 +526,20 @@ class Agent:
         self._last_error = None
         self._same_error_count = 0
 
-        self.messages.append({"role": "user", "content": user_input})
+        if self.provider_name == LOCAL_PROVIDER_NAME and _is_trivial_greeting(user_input):
+            reply = "Hello! What would you like to work on?"
+            self.messages.append({"role": "user", "content": user_input})
+            self.messages.append({"role": "assistant", "content": reply})
+            self.on_text(reply + "\n")
+            self._auto_save()
+            return reply
+
+        message_content = (
+            _local_user_content(user_input)
+            if self.provider_name == LOCAL_PROVIDER_NAME and not self.show_reasoning
+            else user_input
+        )
+        self.messages.append({"role": "user", "content": message_content})
 
         if check_global_budget_exceeded():
             self._safe_print(
@@ -513,15 +693,21 @@ class Agent:
 
     def _create_stream(self):
         """Open a streamed completion, retrying transient errors with backoff."""
+        kwargs = {
+            "model": self.model,
+            "messages": self.messages,
+            "tools": self.tool_schemas,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if self.provider_name == LOCAL_PROVIDER_NAME:
+            kwargs["max_tokens"] = int(
+                os.environ.get("LOCAL_LLM_MAX_TOKENS", str(LOCAL_LLM_DEFAULT_MAX_TOKENS))
+                or str(LOCAL_LLM_DEFAULT_MAX_TOKENS)
+            )
         for attempt in range(MAX_ATTEMPTS):
             try:
-                return self.client.chat.completions.create(
-                    model=self.model,
-                    messages=self.messages,
-                    tools=self.tool_schemas,
-                    stream=True,
-                    stream_options={"include_usage": True},
-                )
+                return self.client.chat.completions.create(**kwargs)
             except RETRYABLE as e:
                 if attempt == MAX_ATTEMPTS - 1:
                     raise
@@ -535,9 +721,11 @@ class Agent:
         assembled from streaming deltas into the standard dict shape."""
         stream = self._create_stream()
         text_parts: list[str] = []
+        local_raw_parts: list[str] = []
         calls: dict[int, dict] = {}
         in_reasoning = False
         finish_reason = None
+        is_local_provider = getattr(self, "provider_name", "") == LOCAL_PROVIDER_NAME
 
         for chunk in stream:
             # Final chunk (include_usage) carries token counts and no choices.
@@ -582,6 +770,24 @@ class Agent:
                 finish_reason = chunk.choices[0].finish_reason
             # thinking mode streams chain-of-thought in reasoning_content
             reasoning = getattr(delta, "reasoning_content", None)
+            if is_local_provider:
+                if reasoning:
+                    local_raw_parts.append(reasoning)
+                if delta.content:
+                    local_raw_parts.append(delta.content)
+                for tc in delta.tool_calls or []:
+                    slot = calls.setdefault(tc.index, {
+                        "id": "", "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    })
+                    if tc.id:
+                        slot["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            slot["function"]["name"] += tc.function.name
+                        if tc.function.arguments:
+                            slot["function"]["arguments"] += tc.function.arguments
+                continue
             if reasoning:
                 if not in_reasoning and not self.show_reasoning:
                     # Start of CoT: show compact thinking indicator
@@ -633,6 +839,17 @@ class Agent:
                     if tc.function.arguments:
                         slot["function"]["arguments"] += tc.function.arguments
 
+        local_text_tool = False
+        if is_local_provider and local_raw_parts:
+            local_text = "".join(local_raw_parts)
+            if self.show_reasoning:
+                cleaned, local_text_tool = _show_local_model_text(local_text)
+            else:
+                cleaned, local_text_tool = _clean_local_model_text(local_text)
+            if cleaned:
+                text_parts.append(cleaned)
+                self.on_text(cleaned)
+
         if in_reasoning:  # stream ended mid-reasoning; clean up display
             if self.show_reasoning:
                 self.on_text("\x1b[0m\n")
@@ -640,8 +857,20 @@ class Agent:
                 self._transient_line(clear=True)
         if text_parts:
             self.on_text("\n")
+        elif local_text_tool and not calls:
+            msg = ("[devbot] Local model emitted a text-form tool call instead of "
+                   "a normal response. Try rephrasing, or use /cloud for tool-heavy tasks.")
+            self.on_text(msg + "\n")
+            text_parts.append(msg)
+        elif is_local_provider and local_raw_parts:
+            msg = ("[devbot] Local model spent the whole response in hidden reasoning. "
+                   "Use /think to show it, try a more direct request, or use /cloud for this prompt.")
+            self.on_text(msg + "\n")
+            text_parts.append(msg)
         # P1-7: warn if the model stopped because it hit the output length limit
-        if finish_reason == "length":
+        if finish_reason == "length" and text_parts and not (
+            is_local_provider and text_parts[-1].startswith("[devbot] Local model spent")
+        ):
             print("\x1b[33m[devbot] Warning: response truncated "
                   "(finish_reason=length).\x1b[0m")
         tool_calls = [calls[i] for i in sorted(calls)] or None
@@ -680,7 +909,11 @@ class Agent:
         ]
 
         try:
-            compress_model = os.environ.get("DEVBOT_COMPRESS_MODEL", "deepseek-v4-flash")
+            default_compress_model = (
+                self.model if getattr(self, "provider_name", "") == LOCAL_PROVIDER_NAME
+                else "deepseek-v4-flash"
+            )
+            compress_model = os.environ.get("DEVBOT_COMPRESS_MODEL", default_compress_model)
             resp = self.client.chat.completions.create(
                 model=compress_model,
                 messages=compress_msgs,

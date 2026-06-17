@@ -54,11 +54,9 @@ def _readme_table_vars(readme_path: Path) -> set[str]:
 def _source_vars(file_paths: list[Path]) -> set[str]:
     """Scan Python files for os.environ[...] / os.environ.get(...) of DEVBOT_* vars."""
     names: set[str] = set()
-    # Matches: os.environ.get("DEVBOT_X", ...)  or  os.environ["DEVBOT_X"]
-    # Also int(os.environ.get(...))
-    pattern = re.compile(
-        r'os\.environ(?:\.get)?\(\s*["\'](DEVBOT_[A-Z_]+)["\']'
-    )
+    # Match literal DEVBOT_* strings in source, covering direct os.environ
+    # access plus central config maps and shared env helper call sites.
+    pattern = re.compile(r'["\'](DEVBOT_[A-Z_]+)["\']')
     for fp in file_paths:
         if not fp.is_file():
             continue
@@ -80,7 +78,10 @@ def test_every_readme_env_var_exists_in_code():
     src_files = [
         PROJECT_ROOT / "devbot" / "agent.py",
         PROJECT_ROOT / "devbot" / "swarm.py",
+        PROJECT_ROOT / "devbot" / "tools.py",
+        PROJECT_ROOT / "devbot" / "config.py",
         PROJECT_ROOT / "devbot" / "devlog.py",
+        PROJECT_ROOT / "devbot" / "evolve_limits.py",
     ]
     code_vars = _source_vars(src_files)
 
@@ -102,7 +103,10 @@ def test_every_code_env_var_exists_in_readme():
     src_files = [
         PROJECT_ROOT / "devbot" / "agent.py",
         PROJECT_ROOT / "devbot" / "swarm.py",
+        PROJECT_ROOT / "devbot" / "tools.py",
+        PROJECT_ROOT / "devbot" / "config.py",
         PROJECT_ROOT / "devbot" / "devlog.py",
+        PROJECT_ROOT / "devbot" / "evolve_limits.py",
     ]
     code_vars = _source_vars(src_files)
 

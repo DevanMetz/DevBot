@@ -17,11 +17,21 @@ except ModuleNotFoundError:  # Python 3.10
 # Mapping from config.toml keys to their corresponding env var names.
 _CONFIG_KEY_MAP: dict[str, str] = {
     "model": "DEVBOT_MODEL",
+    "provider": "DEVBOT_PROVIDER",
+    "local_llm_base_url": "LOCAL_LLM_BASE_URL",
+    "local_llm_model": "LOCAL_LLM_MODEL",
+    "local_llm_api_key": "LOCAL_LLM_API_KEY",
+    "local_llm_max_tokens": "LOCAL_LLM_MAX_TOKENS",
     "max_parallel": "DEVBOT_MAX_PARALLEL",
     "token_budget": "DEVBOT_TOKEN_BUDGET",
     "global_budget": "DEVBOT_GLOBAL_BUDGET",
     "loop_limit": "DEVBOT_LOOP_LIMIT",
     "compress_model": "DEVBOT_COMPRESS_MODEL",
+    "verbosity": "DEVBOT_VERBOSITY",
+    "max_tool_output": "DEVBOT_MAX_TOOL_OUTPUT",
+    "read_file_limit": "DEVBOT_READ_FILE_LIMIT",
+    "diff_clip": "DEVBOT_DIFF_CLIP",
+    "specialist_result_limit": "DEVBOT_SPECIALIST_RESULT_LIMIT",
     "mega_warn_threshold": "DEVBOT_MEGA_WARN_THRESHOLD",
     "pipeline_rounds": "DEVBOT_PIPELINE_ROUNDS",
 }

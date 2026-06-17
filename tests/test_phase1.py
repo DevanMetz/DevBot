@@ -228,6 +228,23 @@ class TestReadFile:
         assert "9\tline9" not in result
         assert "[showing lines 6-8 of 20" in result
 
+    def test_dispatch_uses_env_default_read_limit(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DEVBOT_READ_FILE_LIMIT", "2")
+        root = tmp_path
+        (root / "test.txt").write_text("a\nb\nc\n")
+        result = dispatch("read_file", {"path": "test.txt"}, root)
+        assert "1\ta" in result
+        assert "2\tb" in result
+        assert "3\tc" not in result
+        assert "[showing lines 1-2 of 3" in result
+
+    def test_tool_output_clip_is_configurable(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DEVBOT_MAX_TOOL_OUTPUT", "1000")
+        root = tmp_path
+        (root / "large.txt").write_text("x" * 1200)
+        result = read_file("large.txt", root)
+        assert "[truncated" in result
+
 
 # ============================================================================
 # 4. grep / find_files — SKIP_DIRS and caps
@@ -484,6 +501,11 @@ class TestKeepIndex:
         # This would attempt compression (API call). We do NOT call it; we only
         # verify _keep_index returns 3.
         assert agent._keep_index() == 3
+
+    def test_concise_verbosity_adds_prompt_policy(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DEVBOT_VERBOSITY", "concise")
+        agent = self._make_agent(tmp_path)
+        assert "Token-efficiency mode is active." in agent.messages[0]["content"]
 
 
 # ============================================================================

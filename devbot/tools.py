@@ -13,7 +13,8 @@ import sys
 import time
 from pathlib import Path
 
-MAX_OUTPUT = 50_000  # chars returned to the model per tool call
+MAX_OUTPUT = 50_000  # default chars returned to the model per tool call
+DEFAULT_READ_FILE_LIMIT = 2000
 
 _BACKUPS_DIR = ".devbot/backups"
 _MAX_BACKUP_SETS = 20
@@ -205,13 +206,31 @@ def check_command(command: str) -> tuple:
     return ("needs_approval", "not on allow-list")
 
 
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    """Read a non-negative int from env, falling back on bad values."""
+    try:
+        value = int(os.environ.get(name, str(default)) or str(default))
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def _max_output() -> int:
+    return _env_int("DEVBOT_MAX_TOOL_OUTPUT", MAX_OUTPUT, minimum=1000)
+
+
+def _default_read_limit() -> int:
+    return _env_int("DEVBOT_READ_FILE_LIMIT", DEFAULT_READ_FILE_LIMIT, minimum=1)
+
+
 def _clip(text: str) -> str:
-    if len(text) >= MAX_OUTPUT:
-        return text[:MAX_OUTPUT] + f"\n... [truncated, {len(text)} chars total]"
+    max_output = _max_output()
+    if len(text) >= max_output:
+        return text[:max_output] + f"\n... [truncated, {len(text)} chars total]"
     return text
 
 
-DIFF_CLIP = 2000   # chars of unified diff returned to the model
+DIFF_CLIP = 2000   # default chars of unified diff returned to the model
 
 
 def _compute_diff(old_content: str, new_content: str, filename: str) -> str:
@@ -230,8 +249,9 @@ def _compute_diff(old_content: str, new_content: str, filename: str) -> str:
     diff_text = "".join(diff_lines)
     full_block = f"```diff\n{diff_text}```"
 
-    if len(full_block) > DIFF_CLIP:
-        full_block = full_block[:DIFF_CLIP] + "\n... [diff truncated]"
+    diff_clip = _env_int("DEVBOT_DIFF_CLIP", DIFF_CLIP, minimum=200)
+    if len(full_block) > diff_clip:
+        full_block = full_block[:diff_clip] + "\n... [diff truncated]"
 
     return full_block
 
@@ -255,13 +275,15 @@ def _resolve(path: str, root: Path) -> Path:
     return p
 
 
-def read_file(path: str, root: Path, offset: int = 0, limit: int = 2000) -> str:
+def read_file(path: str, root: Path, offset: int = 0,
+              limit: int | None = None) -> str:
     p = _resolve(path, root)
     if not p.is_file():
         return f"Error: {p} is not a file"
     lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     total = len(lines)
     offset = max(0, offset)
+    limit = _default_read_limit() if limit is None else max(1, limit)
     if offset >= total:
         return f"Error: offset {offset} is beyond file end ({total} lines)"
     chunk = lines[offset : offset + limit]
@@ -1022,7 +1044,7 @@ DANGEROUS_TOOLS = {"write_file", "edit_file", "run_command", "verify", "undo_las
 # Null-safe arg.get(key) or default handles JSON null coercion (P1-11).
 _TOOL_HANDLERS = {
     "read_file": lambda a, r: read_file(
-        a["path"], r, a.get("offset") or 0, a.get("limit") or 2000),
+        a["path"], r, a.get("offset") or 0, a.get("limit")),
     "write_file": lambda a, r: write_file(a["path"], a["content"], r),
     "edit_file": lambda a, r: edit_file(
         a["path"], a["old_string"], a["new_string"], r, a.get("replace_all") or False),

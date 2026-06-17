@@ -1,7 +1,7 @@
 """Tests for the autopilot plan runner. No network calls (Agent is mocked)."""
 
 import devbot.autopilot as autopilot
-from devbot.autopilot import parse_phases, run_plan
+from devbot.autopilot import _phase_prompt, parse_phases, run_plan
 
 
 PLAN = """\
@@ -41,6 +41,14 @@ class TestParsePhases:
 
     def test_no_phases_returns_empty(self):
         assert parse_phases("# Just a title\n\nsome prose") == []
+
+    def test_phase_prompt_uses_outline_not_full_plan_body(self):
+        phases = parse_phases(PLAN)
+        prompt = _phase_prompt(phases, 0)
+        assert "=== PLAN OUTLINE ===" in prompt
+        assert "Phase 2: Second thing" in prompt
+        assert "Do the first thing." in prompt
+        assert "Do the second thing." not in prompt
 
 
 # ---------------------------------------------------------------------------

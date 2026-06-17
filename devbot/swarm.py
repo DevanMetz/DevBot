@@ -140,7 +140,7 @@ def run_specialist(manager: "Agent", role: str, task: str) -> str:
     # Roll the sub-agent's token usage up into the manager's session totals.
     manager.total_tokens += sub.total_tokens
     manager.delegation_count += 1
-    return answer or "(specialist returned no text)"
+    return _clip_agent_result(answer or "(specialist returned no text)", role)
 
 
 def run_specialist_with_prompt(manager: "Agent", role: str, system_prompt: str,
@@ -171,7 +171,7 @@ def run_specialist_with_prompt(manager: "Agent", role: str, system_prompt: str,
     print(f"\n\x1b[35m╰─ [{lbl}] done in {time.time() - start:.1f}s\x1b[0m")
     manager.total_tokens += sub.total_tokens
     manager.delegation_count += 1
-    return answer or "(specialist returned no text)"
+    return _clip_agent_result(answer or "(specialist returned no text)", lbl)
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +195,22 @@ MEGASWARM_REVIEWER_PROMPT = (
     "- If one specialist clearly had the best answer, lean on it but still incorporate "
     "unique insights from the others."
 )
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)) or str(default))
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def _clip_agent_result(text: str, label: str = "agent result") -> str:
+    """Bound sub-agent text before feeding it back into another agent."""
+    limit = _env_int("DEVBOT_SPECIALIST_RESULT_LIMIT", 8000, minimum=500)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... [{label} truncated, {len(text)} chars total]"
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +655,11 @@ def run_megaswarm(manager: "Agent", task: str, n: int = 3,
                 monitor.update(_label, phase='failed')
         finally:
             _sem.release()
-        return _role, (answer or "(specialist returned no text)"), sub.total_tokens
+        return (
+            _role,
+            _clip_agent_result(answer or "(specialist returned no text)", _label),
+            sub.total_tokens,
+        )
 
     results: dict[str, str] = {}
     skipped = 0
@@ -748,7 +768,10 @@ def run_megaswarm(manager: "Agent", task: str, n: int = 3,
     print(f"\x1b[35m  ╟─ [reviewer] done in {phase2_elapsed:.1f}s\x1b[0m")
     print(f"\x1b[35;1m╚═ MEGASWARM complete in {total_elapsed:.1f}s\x1b[0m")
 
-    return synthesis or "(megaswarm reviewer returned no text)"
+    return _clip_agent_result(
+        synthesis or "(megaswarm reviewer returned no text)",
+        "megaswarm synthesis",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -843,4 +866,4 @@ def run_pipeline(manager: "Agent", task: str) -> str:
               f"({_get_pipeline_rounds()}); some issues may remain\x1b[0m")
 
     print(f"\x1b[36;1m╚═ PIPELINE complete\x1b[0m")
-    return "\n\n".join(transcript)
+    return _clip_agent_result("\n\n".join(transcript), "pipeline transcript")
